@@ -213,8 +213,7 @@ fn next_sequence(tasks: &[Task]) -> i64 {
 /// Calendar addition that never panics: overflow falls back to `date`
 /// (unreachable for real schedules; keeps the engine infallible).
 fn add_days(date: NaiveDate, days: u64) -> NaiveDate {
-    date
-        .checked_add_days(chrono::Days::new(days))
+    date.checked_add_days(chrono::Days::new(days))
         .unwrap_or(date)
 }
 
@@ -285,6 +284,46 @@ pub fn format_chapter_start_prompt(title: &str, start_page: i64, end_page: i64) 
 /// # Errors
 ///
 /// Propagates [`Error::Store`] from the backend.
+/// Unlock one `LOCKED` chapter whose gating predecessor finished reading.
+/// Returns whether this chapter chained behind finished work (its first
+/// pretest belongs to tomorrow, not to the day just closed).
+fn unlock_chapter(
+    store: &mut dyn Store,
+    chapter: &Chapter,
+    statuses: &mut [ChapterStatus],
+    position: usize,
+    created_at: &str,
+) -> Result<bool> {
+    if statuses
+        .get(position)
+        .copied()
+        .unwrap_or(ChapterStatus::Locked)
+        != ChapterStatus::Locked
+    {
+        return Ok(false);
+    }
+    // Look back past skipped chapters for the gating predecessor.
+    let predecessor = live_predecessor(statuses, position);
+    let blocked = predecessor.is_some_and(|prev| !reading_done_or_beyond(prev));
+    if blocked {
+        return Ok(false);
+    }
+    store.set_chapter_status(chapter.id, ChapterStatus::PretestReady)?;
+    store.log_event(
+        "CHAPTER_UNLOCKED",
+        Some(chapter.id),
+        None,
+        Some(chapter.title.as_str()),
+        created_at,
+    )?;
+    if let Some(slot) = statuses.get_mut(position) {
+        *slot = ChapterStatus::PretestReady;
+    }
+    // A non-head unlock chains behind finished work: its first
+    // pretest belongs to tomorrow, not to the day just closed.
+    Ok(predecessor.is_some())
+}
+
 pub fn ensure_tasks(
     store: &mut dyn Store,
     book_id: i64,
@@ -302,32 +341,15 @@ pub fn ensure_tasks(
             .get(position)
             .copied()
             .unwrap_or(ChapterStatus::Locked);
-        // Chained unlocks (a finished non-skipped predecessor) start tomorrow
-        // so a closed Day N stays closed; head chapters start today.
-        let mut unlocked_behind_predecessor = false;
         // Unlock rule: the head chapter and any chapter whose earlier
         // non-skipped chapters all finished reading become available.
-        if current == ChapterStatus::Locked {
-            // Look back past skipped chapters for the gating predecessor.
-            let predecessor = live_predecessor(&statuses, position);
-            let blocked = predecessor.is_some_and(|prev| !reading_done_or_beyond(prev));
-            if !blocked {
-                store.set_chapter_status(chapter.id, ChapterStatus::PretestReady)?;
-                store.log_event(
-                    "CHAPTER_UNLOCKED",
-                    Some(chapter.id),
-                    None,
-                    Some(chapter.title.as_str()),
-                    created_at,
-                )?;
-                // A non-head unlock chains behind finished work: its first
-                // pretest belongs to tomorrow, not to the day just closed.
-                unlocked_behind_predecessor = predecessor.is_some();
-                if let Some(slot) = statuses.get_mut(position) {
-                    *slot = ChapterStatus::PretestReady;
-                }
-            }
-        }
+        // Chained unlocks (a finished non-skipped predecessor) start tomorrow
+        // so a closed Day N stays closed; head chapters start today.
+        let unlocked_behind_predecessor = if current == ChapterStatus::Locked {
+            unlock_chapter(store, chapter, &mut statuses, position, created_at)?
+        } else {
+            false
+        };
         // Crash-safety: a chapter stranded at PRETEST_COMPLETE never got its
         // reading stage opened; open it now before creating the READ task.
         let current = statuses
@@ -385,6 +407,52 @@ pub fn ensure_tasks(
         created.push(task);
     }
     Ok(created)
+}
+
+/// After `NOTES` completes, the chapter is `COMPLETED`: unlock the next
+/// `LOCKED` sibling with its first `PRETEST` due tomorrow (pullable today;
+/// skipped chapters stay skipped). Returns the fresh pretest, if any.
+fn unlock_next_after_notes(
+    store: &mut dyn Store,
+    chapter: &Chapter,
+    today: NaiveDate,
+    completed_at: &str,
+) -> Result<Option<Task>> {
+    let siblings = store.list_chapters(chapter.book_id)?;
+    let position = siblings.iter().position(|c| c.id == chapter.id);
+    if let Some(index) = position {
+        for sibling in siblings.iter().skip(index.saturating_add(1)) {
+            if sibling.status != ChapterStatus::Locked {
+                continue;
+            }
+            store.set_chapter_status(sibling.id, ChapterStatus::PretestReady)?;
+            store.log_event(
+                "CHAPTER_UNLOCKED",
+                Some(sibling.id),
+                None,
+                Some(sibling.title.as_str()),
+                completed_at,
+            )?;
+            let fresh = store.list_tasks()?;
+            let created = store.create_task(&NewTask {
+                book_id: sibling.book_id,
+                chapter_id: sibling.id,
+                task_type: TaskType::Pretest,
+                scheduled_for: add_days(today, 1),
+                sequence: next_sequence(&fresh),
+                attempt_no: sibling.attempt_no,
+            })?;
+            store.log_event(
+                "TASK_SCHEDULED",
+                Some(sibling.id),
+                Some(created.id),
+                Some(TaskType::Pretest.as_str()),
+                completed_at,
+            )?;
+            return Ok(Some(created));
+        }
+    }
+    Ok(None)
 }
 
 /// Complete one task and advance the pipeline (§4–§5).
@@ -472,41 +540,7 @@ pub fn complete_and_advance(
     // NOTES done: chapter is COMPLETED; unlock the next LOCKED chapter with
     // its first PRETEST due tomorrow (pullable today; skipped chapters stay
     // skipped).
-    let siblings = store.list_chapters(chapter.book_id)?;
-    let position = siblings.iter().position(|c| c.id == chapter.id);
-    if let Some(index) = position {
-        for sibling in siblings.iter().skip(index.saturating_add(1)) {
-            if sibling.status != ChapterStatus::Locked {
-                continue;
-            }
-            store.set_chapter_status(sibling.id, ChapterStatus::PretestReady)?;
-            store.log_event(
-                "CHAPTER_UNLOCKED",
-                Some(sibling.id),
-                None,
-                Some(sibling.title.as_str()),
-                completed_at,
-            )?;
-            let fresh = store.list_tasks()?;
-            let created = store.create_task(&NewTask {
-                book_id: sibling.book_id,
-                chapter_id: sibling.id,
-                task_type: TaskType::Pretest,
-                scheduled_for: add_days(today, 1),
-                sequence: next_sequence(&fresh),
-                attempt_no: sibling.attempt_no,
-            })?;
-            store.log_event(
-                "TASK_SCHEDULED",
-                Some(sibling.id),
-                Some(created.id),
-                Some(TaskType::Pretest.as_str()),
-                completed_at,
-            )?;
-            return Ok(Some(created));
-        }
-    }
-    Ok(None)
+    unlock_next_after_notes(store, &chapter, today, completed_at)
 }
 
 /// Skip a chapter (§4.1): status → `SKIPPED`, pending tasks deleted.
@@ -561,9 +595,10 @@ pub fn unskip_chapter(
             chapter.status.as_str()
         )));
     }
-    let attempt = chapter.attempt_no.checked_add(1).ok_or_else(|| {
-        Error::Store("chapter attempt_no overflow".to_string())
-    })?;
+    let attempt = chapter
+        .attempt_no
+        .checked_add(1)
+        .ok_or_else(|| Error::Store("chapter attempt_no overflow".to_string()))?;
     store.set_chapter_attempt(chapter_id, attempt)?;
     store.set_chapter_status(chapter_id, ChapterStatus::PretestReady)?;
     store.log_event(
@@ -610,16 +645,19 @@ pub struct WindowRow {
 ///
 /// This function is infallible by construction but returns `Result` to keep
 /// the engine interface uniform; it always returns `Ok`.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "infallible by construction; Result keeps the engine interface uniform"
+)]
 pub fn project_window(
     chapters: i64,
     start: NaiveDate,
 ) -> crate::error::Result<Vec<(NaiveDate, WindowRow)>> {
     let mut out = Vec::new();
     for offset in 0..chapters {
-        let Some(day_n) = start.checked_add_days(chrono::Days::new(
-            u64::try_from(offset).unwrap_or_default(),
-        )) else {
+        let Some(day_n) =
+            start.checked_add_days(chrono::Days::new(u64::try_from(offset).unwrap_or_default()))
+        else {
             continue;
         };
         let Some(day_n1) = day_n.checked_add_days(chrono::Days::new(1)) else {
@@ -694,7 +732,12 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
         let tasks = vec![
             task(TaskType::Pretest, "2026-01-10", TaskStatus::Pending, 1),
-            task(TaskType::AssignmentWrite, "2026-01-09", TaskStatus::Pending, 2),
+            task(
+                TaskType::AssignmentWrite,
+                "2026-01-09",
+                TaskStatus::Pending,
+                2,
+            ),
             task(TaskType::Retest, "2026-01-09", TaskStatus::Pending, 3),
             task(TaskType::Retest, "2026-01-10", TaskStatus::Pending, 4),
         ];
@@ -722,7 +765,12 @@ mod tests {
         let mixed = vec![
             task(TaskType::Notes, "2026-01-10", TaskStatus::Pending, 1),
             task(TaskType::Retest, "2026-01-10", TaskStatus::Pending, 2),
-            task(TaskType::AssignmentWrite, "2026-01-10", TaskStatus::Pending, 3),
+            task(
+                TaskType::AssignmentWrite,
+                "2026-01-10",
+                TaskStatus::Pending,
+                3,
+            ),
         ];
         let ordered = today_queue(&mixed, today);
         assert_eq!(ordered[0].task_type, TaskType::Retest);
@@ -733,9 +781,19 @@ mod tests {
     #[test]
     fn pull_requires_empty_mandatory_queue() {
         let today = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
-        let pending = vec![task(TaskType::Pretest, "2026-01-10", TaskStatus::Pending, 1)];
+        let pending = vec![task(
+            TaskType::Pretest,
+            "2026-01-10",
+            TaskStatus::Pending,
+            1,
+        )];
         assert!(!pull_available(&pending, today));
-        let clear = vec![task(TaskType::Pretest, "2026-01-11", TaskStatus::Pending, 1)];
+        let clear = vec![task(
+            TaskType::Pretest,
+            "2026-01-11",
+            TaskStatus::Pending,
+            1,
+        )];
         assert!(pull_available(&clear, today));
     }
 
@@ -746,7 +804,12 @@ mod tests {
         let today = date("2026-01-10");
         let tasks = vec![
             task(TaskType::Retest, "2026-01-11", TaskStatus::Pending, 1),
-            task(TaskType::AssignmentWrite, "2026-01-11", TaskStatus::Pending, 2),
+            task(
+                TaskType::AssignmentWrite,
+                "2026-01-11",
+                TaskStatus::Pending,
+                2,
+            ),
             task(TaskType::Pretest, "2026-01-13", TaskStatus::Pending, 3),
         ];
         let next = next_pull_candidate(&tasks, today).unwrap();
@@ -755,7 +818,12 @@ mod tests {
         // No future pretest at all: future retests alone pull nothing.
         let spaced = vec![
             task(TaskType::Retest, "2026-01-11", TaskStatus::Pending, 1),
-            task(TaskType::AssignmentWrite, "2026-01-12", TaskStatus::Pending, 2),
+            task(
+                TaskType::AssignmentWrite,
+                "2026-01-12",
+                TaskStatus::Pending,
+                2,
+            ),
             task(TaskType::Notes, "2026-01-12", TaskStatus::Pending, 3),
         ];
         assert!(next_pull_candidate(&spaced, today).is_none());
@@ -838,7 +906,11 @@ mod tests {
                 "2026-01-10",
             )
             .unwrap();
-        assert!(pull_next(&mut store, today, "2026-01-10").unwrap().is_none());
+        assert!(
+            pull_next(&mut store, today, "2026-01-10")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -857,7 +929,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retest.task_type, TaskType::Retest);
-        assert!(pull_next(&mut store, today, "2026-01-10").unwrap().is_none());
+        assert!(
+            pull_next(&mut store, today, "2026-01-10")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store.get_task(retest.id).unwrap().scheduled_for,
             date("2026-01-11")
@@ -905,7 +981,11 @@ mod tests {
                 attempt_no: 1,
             })
             .unwrap();
-        assert!(pull_next(&mut store, today, "2026-01-10").unwrap().is_none());
+        assert!(
+            pull_next(&mut store, today, "2026-01-10")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -994,7 +1074,10 @@ mod tests {
             .unwrap();
         let today = date("2026-01-10");
         let made = ensure_tasks(&mut store, book, today, "2026-01-10").unwrap();
-        assert_eq!(store.get_chapter(first).unwrap().status, ChapterStatus::ReadAvailable);
+        assert_eq!(
+            store.get_chapter(first).unwrap().status,
+            ChapterStatus::ReadAvailable
+        );
         assert_eq!(made.len(), 1);
         assert_eq!(made[0].task_type, TaskType::Read);
     }
@@ -1053,11 +1136,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(notes.task_type, TaskType::Notes);
-        let unlocked =
-            complete_and_advance(&mut store, notes.id, date("2026-01-12"), "2026-01-12")
-                .unwrap()
-                .unwrap();
-        assert_eq!(store.get_chapter(first).unwrap().status, ChapterStatus::Completed);
+        let unlocked = complete_and_advance(&mut store, notes.id, date("2026-01-12"), "2026-01-12")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_chapter(first).unwrap().status,
+            ChapterStatus::Completed
+        );
         assert_eq!(
             store.get_chapter(second).unwrap().status,
             ChapterStatus::PretestReady

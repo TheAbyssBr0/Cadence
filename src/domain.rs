@@ -242,7 +242,10 @@ impl TaskStatus {
 
 /// A scheduled task. `scheduled_for` is a calendar date (`YYYY-MM-DD`),
 /// never a session count (§5).
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "task_type follows the domain vocabulary; renaming diverges from the spec"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     /// Row id (0 = not yet persisted).
@@ -362,10 +365,7 @@ mod tests {
             (TaskType::Read, ChapterStatus::ReadAvailable),
             (TaskType::Read, ChapterStatus::ReadComplete),
             (TaskType::Retest, ChapterStatus::RetestComplete),
-            (
-                TaskType::AssignmentWrite,
-                ChapterStatus::AssignmentComplete,
-            ),
+            (TaskType::AssignmentWrite, ChapterStatus::AssignmentComplete),
             (TaskType::Notes, ChapterStatus::Completed),
         ] {
             status = status.complete(task).unwrap();

@@ -18,7 +18,10 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -430,12 +433,10 @@ impl LlmConfig {
         let mut config = Self::resolve(&gateway_key, &google_key, &custom_key, &model, &endpoint)?;
         let timeout = Self::value_from_env("CADENCE_LLM_TIMEOUT_S");
         config.timeout_secs = parse_timeout_secs(&timeout, config.timeout_secs);
-        config.disable_thinking = parse_disable_thinking(
-            Self::value_from_env("CADENCE_DISABLE_THINKING").as_str(),
-        );
-        config.thinking_effort = parse_thinking_effort(
-            Self::value_from_env("CADENCE_THINKING_EFFORT").as_str(),
-        );
+        config.disable_thinking =
+            parse_disable_thinking(Self::value_from_env("CADENCE_DISABLE_THINKING").as_str());
+        config.thinking_effort =
+            parse_thinking_effort(Self::value_from_env("CADENCE_THINKING_EFFORT").as_str());
         Ok(config)
     }
 
@@ -548,9 +549,12 @@ pub fn parse_timeout_secs(raw: &str, default_secs: u64) -> u64 {
     if trimmed.is_empty() {
         return default_secs;
     }
-    trimmed.parse::<u64>().map_or(default_secs, |secs| {
-        if secs == 0 { default_secs } else { secs }
-    })
+    trimmed.parse::<u64>().map_or(
+        default_secs,
+        |secs| {
+            if secs == 0 { default_secs } else { secs }
+        },
+    )
 }
 
 /// Parse `CADENCE_DISABLE_THINKING`: `1`/`true`/`yes` (case-insensitive)
@@ -850,7 +854,13 @@ impl RawTransport for HttpLlmProvider {
             Ok(body) => body,
             Err(e) => return ProviderOutcome::Fatal(e.to_string()),
         };
-        let response = match self.client.post(&url).bearer_auth(&self.config.api_key).json(&body).send() {
+        let response = match self
+            .client
+            .post(&url)
+            .bearer_auth(&self.config.api_key)
+            .json(&body)
+            .send()
+        {
             Ok(response) => response,
             Err(e) => return Self::transport_error(&e),
         };
@@ -952,9 +962,10 @@ impl MockLlm {
 impl RawTransport for MockLlm {
     fn send(&self, _prompt: &str) -> ProviderOutcome {
         self.calls.set(self.calls.get().saturating_add(1));
-        self.outcomes.borrow_mut().pop_front().unwrap_or_else(|| {
-            ProviderOutcome::Fatal("mock transport exhausted".to_string())
-        })
+        self.outcomes
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| ProviderOutcome::Fatal("mock transport exhausted".to_string()))
     }
 
     fn provider_id(&self) -> &str {
@@ -1047,7 +1058,10 @@ pub fn request_json(prompt: &str, params_json: &str) -> Result<String> {
 ///
 /// Returns [`Error::LlmFatal`] on validation exhaustion, provider refusal,
 /// and transport exhaustion, plus [`Error::Store`] on persistence failures.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "cache, durable-job, retry, and validation stages run in fixed order"
+)]
 pub fn complete_cached(
     transport: &dyn RawTransport,
     store: &mut dyn Store,
@@ -1065,15 +1079,15 @@ pub fn complete_cached(
     };
     let hash = identity.cache_hash();
 
-    if let Some(entry) = store.get_llm_cache(&hash)? {
-        if let Ok(text) = validate(&entry.response_json) {
-            return Ok(CallResult {
-                text,
-                cache_hit: true,
-                transport_calls: 0,
-                job_id: 0,
-            });
-        }
+    if let Some(entry) = store.get_llm_cache(&hash)?
+        && let Ok(text) = validate(&entry.response_json)
+    {
+        return Ok(CallResult {
+            text,
+            cache_hit: true,
+            transport_calls: 0,
+            job_id: 0,
+        });
     }
 
     let stored_json = request_json(request.prompt, request.params_json)?;
@@ -1208,14 +1222,7 @@ fn fail_job(
     message: &str,
     raw: Option<&str>,
 ) -> Result<()> {
-    store.record_llm_attempt(
-        job_id,
-        i64::from(sends),
-        "FAILED",
-        raw,
-        None,
-        Some(message),
-    )
+    store.record_llm_attempt(job_id, i64::from(sends), "FAILED", raw, None, Some(message))
 }
 
 /// §16 hard-failure message: state is on the job row, rerun resumes.
@@ -1515,7 +1522,12 @@ mod tests {
         // Gateway path never carries the constraint, even when configured.
         let mut gateway = config_for(PROVIDER_ID);
         gateway.response_format_json = Some(format);
-        assert!(chat_body(&gateway, "hi").unwrap().get("response_format").is_none());
+        assert!(
+            chat_body(&gateway, "hi")
+                .unwrap()
+                .get("response_format")
+                .is_none()
+        );
         // Thinking controls are custom-path only and on at medium by
         // default (server defaults vary by model, so the body is explicit).
         assert_eq!(
@@ -1537,14 +1549,34 @@ mod tests {
         );
         let mut gateway_think = config_for(PROVIDER_ID);
         gateway_think.disable_thinking = true;
-        assert!(chat_body(&gateway_think, "hi").unwrap().get("chat_template_kwargs").is_none());
+        assert!(
+            chat_body(&gateway_think, "hi")
+                .unwrap()
+                .get("chat_template_kwargs")
+                .is_none()
+        );
         // Hosted paths never carry template kwargs (non-portable extension).
-        assert!(chat_body(&config_for(GEMINI_PROVIDER_ID), "hi").unwrap().get("chat_template_kwargs").is_none());
+        assert!(
+            chat_body(&config_for(GEMINI_PROVIDER_ID), "hi")
+                .unwrap()
+                .get("chat_template_kwargs")
+                .is_none()
+        );
         let mut google_think = config_for(GEMINI_PROVIDER_ID);
         google_think.disable_thinking = true;
-        assert!(chat_body(&google_think, "hi").unwrap().get("chat_template_kwargs").is_none());
+        assert!(
+            chat_body(&google_think, "hi")
+                .unwrap()
+                .get("chat_template_kwargs")
+                .is_none()
+        );
         // Unset format means an unconstrained body on either path.
-        assert!(chat_body(&config_for(GEMINI_PROVIDER_ID), "hi").unwrap().get("response_format").is_none());
+        assert!(
+            chat_body(&config_for(GEMINI_PROVIDER_ID), "hi")
+                .unwrap()
+                .get("response_format")
+                .is_none()
+        );
         // Corrupt format fails loudly instead of silently unconstrained.
         let mut broken = config_for(GEMINI_PROVIDER_ID);
         broken.response_format_json = Some("{broken".to_string());
@@ -1695,10 +1727,7 @@ mod tests {
         let err = call(&stub, &mut store, "p-stop", &reject, &sleeps).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("bad"), "{text}");
-        assert!(
-            text.contains("stop finish=length eos=loop"),
-            "{text}"
-        );
+        assert!(text.contains("stop finish=length eos=loop"), "{text}");
         // Still exactly the fast malformed budget: annotation adds no sends.
         assert_eq!(stub.calls.get(), 3);
         assert!(sleeps.borrow().is_empty());
@@ -1812,8 +1841,7 @@ mod tests {
         assert_eq!(sleeps.borrow().len(), 1);
         let slept = sleeps.borrow()[0];
         assert!(
-            slept >= Duration::from_millis(1_000)
-                && slept <= Duration::from_millis(1_250),
+            slept >= Duration::from_millis(1_000) && slept <= Duration::from_millis(1_250),
             "first backoff should be base + small jitter, got {slept:?}"
         );
     }
@@ -1837,7 +1865,9 @@ mod tests {
 
     #[test]
     fn fatal_never_retries() {
-        let transport = MockLlm::new(vec![ProviderOutcome::Fatal("HTTP 401: bad key".to_string())]);
+        let transport = MockLlm::new(vec![ProviderOutcome::Fatal(
+            "HTTP 401: bad key".to_string(),
+        )]);
         let mut store = MemoryStore::new();
         let sleeps = RefCell::new(Vec::new());
         let ok = |s: &str| Ok(s.to_string());
@@ -1851,11 +1881,26 @@ mod tests {
     #[test]
     fn transport_exhaustion_reports_last_error() {
         let transport = MockLlm::new(vec![
-            ProviderOutcome::Retryable { message: "e0".to_string(), retry_after: None },
-            ProviderOutcome::Retryable { message: "e1".to_string(), retry_after: None },
-            ProviderOutcome::Retryable { message: "e2".to_string(), retry_after: None },
-            ProviderOutcome::Retryable { message: "e3".to_string(), retry_after: None },
-            ProviderOutcome::Retryable { message: "e4-final".to_string(), retry_after: None },
+            ProviderOutcome::Retryable {
+                message: "e0".to_string(),
+                retry_after: None,
+            },
+            ProviderOutcome::Retryable {
+                message: "e1".to_string(),
+                retry_after: None,
+            },
+            ProviderOutcome::Retryable {
+                message: "e2".to_string(),
+                retry_after: None,
+            },
+            ProviderOutcome::Retryable {
+                message: "e3".to_string(),
+                retry_after: None,
+            },
+            ProviderOutcome::Retryable {
+                message: "e4-final".to_string(),
+                retry_after: None,
+            },
         ]);
         let mut store = MemoryStore::new();
         let sleeps = RefCell::new(Vec::new());
@@ -1886,7 +1931,11 @@ mod tests {
         // Huge indices wrap instead of panicking (no indexing/slicing).
         assert_eq!(
             spinner_frame_at(usize::MAX),
-            spinner_frame_at(usize::MAX.checked_rem(SPINNER_FRAMES.len()).unwrap_or_default())
+            spinner_frame_at(
+                usize::MAX
+                    .checked_rem(SPINNER_FRAMES.len())
+                    .unwrap_or_default()
+            )
         );
         // Every frame in the rotation is non-empty.
         for index in 0..SPINNER_FRAMES.len().saturating_mul(2) {

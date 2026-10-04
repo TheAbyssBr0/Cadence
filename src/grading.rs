@@ -202,9 +202,9 @@ pub fn parse_rubric_json(text: &str) -> Result<Rubric> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| Error::InvalidInput(format!("rubric is not valid JSON: {e}")))?;
     let get = |field: &str| {
-        value.get(field).ok_or_else(|| {
-            Error::InvalidInput(format!("rubric missing '{field}'"))
-        })
+        value
+            .get(field)
+            .ok_or_else(|| Error::InvalidInput(format!("rubric missing '{field}'")))
     };
     let raw_criteria = get("criteria")?
         .as_array()
@@ -221,17 +221,13 @@ pub fn parse_rubric_json(text: &str) -> Result<Rubric> {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("rubric criterion {index} needs a name"))
-            })?;
+            .ok_or_else(|| Error::InvalidInput(format!("rubric criterion {index} needs a name")))?;
         let max_score = raw
             .get("max_score")
             .and_then(serde_json::Value::as_i64)
             .filter(|s| *s >= 1)
             .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "rubric criterion {index} needs max_score >= 1"
-                ))
+                Error::InvalidInput(format!("rubric criterion {index} needs max_score >= 1"))
             })?;
         let what_good = raw
             .get("what_good_looks_like")
@@ -281,7 +277,8 @@ pub fn build_grading_prompt(question: &str, rubric: &Rubric, answer: &str) -> St
         );
     }
     let question_block = if question.trim().is_empty() {
-        "No question text supplied: judge the answer against the rubric and model solution below.".to_string()
+        "No question text supplied: judge the answer against the rubric and model solution below."
+            .to_string()
     } else {
         format!("--- QUESTION ---\n{question}\n--- END QUESTION ---")
     };
@@ -290,6 +287,59 @@ pub fn build_grading_prompt(question: &str, rubric: &Rubric, answer: &str) -> St
         max = rubric.max_score,
         solution = rubric.model_solution,
     )
+}
+
+/// Validate one per-criterion result: named, echoed maximum matches a frozen
+/// criterion exactly once (consumed by name+max), score in range, commented.
+///
+/// # Errors
+///
+/// Returns [`Error::LlmFatal`] describing the defect.
+fn validate_criterion_result(
+    raw: &serde_json::Value,
+    index: usize,
+    remaining: &mut Vec<(&str, i64)>,
+) -> Result<CriterionResult> {
+    let name = raw
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::LlmFatal(format!("grade criterion {index} needs a name")))?;
+    let result_max = raw
+        .get("max_score")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            Error::LlmFatal(format!("grade criterion {index} needs integer 'max_score'"))
+        })?;
+    let result_score = raw
+        .get("score")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::LlmFatal(format!("grade criterion {index} needs integer 'score'")))?;
+    let comment = raw
+        .get("comment")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::LlmFatal(format!("grade criterion {index} needs a comment")))?;
+    let Some(matched) = remaining
+        .iter()
+        .position(|(n, m)| *n == name && *m == result_max)
+    else {
+        return Err(Error::LlmFatal(format!(
+            "grade criterion {index} ('{name}' max {result_max}) matches no frozen criterion exactly once"
+        )));
+    };
+    remaining.remove(matched);
+    if result_score < 0 || result_score > result_max {
+        return Err(Error::LlmFatal(format!(
+            "grade criterion {index} score {result_score} outside 0-{result_max}"
+        )));
+    }
+    Ok(CriterionResult {
+        name: name.to_string(),
+        score: result_score,
+        max_score: result_max,
+        comment: comment.to_string(),
+    })
 }
 
 /// Validate one grader response against the frozen rubric: known §10 verdict,
@@ -307,8 +357,11 @@ pub fn validate_grade(text: &str, rubric: &Rubric) -> Result<Grade> {
         .get("classification")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| Error::LlmFatal("grade missing 'classification'".to_string()))?;
-    let classification = GradeClass::parse(classification_label)
-        .map_err(|_| Error::LlmFatal(format!("grade has bad classification '{classification_label}'")))?;
+    let classification = GradeClass::parse(classification_label).map_err(|_| {
+        Error::LlmFatal(format!(
+            "grade has bad classification '{classification_label}'"
+        ))
+    })?;
     let score = parsed
         .get("score")
         .and_then(serde_json::Value::as_i64)
@@ -332,50 +385,7 @@ pub fn validate_grade(text: &str, rubric: &Rubric) -> Result<Grade> {
         .collect();
     let mut criteria_results = Vec::with_capacity(raw_results.len());
     for (index, raw) in raw_results.iter().enumerate() {
-        let name = raw
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::LlmFatal(format!("grade criterion {index} needs a name")))?;
-        let result_max = raw
-            .get("max_score")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| {
-                Error::LlmFatal(format!("grade criterion {index} needs integer 'max_score'"))
-            })?;
-        let result_score = raw
-            .get("score")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| {
-                Error::LlmFatal(format!("grade criterion {index} needs integer 'score'"))
-            })?;
-        let comment = raw
-            .get("comment")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::LlmFatal(format!("grade criterion {index} needs a comment"))
-            })?;
-        let Some(matched) = remaining
-            .iter()
-            .position(|(n, m)| *n == name && *m == result_max)
-        else {
-            return Err(Error::LlmFatal(format!(
-                "grade criterion {index} ('{name}' max {result_max}) matches no frozen criterion exactly once"
-            )));
-        };
-        remaining.remove(matched);
-        if result_score < 0 || result_score > result_max {
-            return Err(Error::LlmFatal(format!(
-                "grade criterion {index} score {result_score} outside 0-{result_max}"
-            )));
-        }
-        criteria_results.push(CriterionResult {
-            name: name.to_string(),
-            score: result_score,
-            max_score: result_max,
-            comment: comment.to_string(),
-        });
+        criteria_results.push(validate_criterion_result(raw, index, &mut remaining)?);
     }
     if !remaining.is_empty() {
         return Err(Error::LlmFatal(format!(
@@ -416,8 +426,8 @@ mod tests {
                 },
             ],
             max_score: 8,
-            model_solution: "The & operator yields the address of its operand; aliasing needs care."
-                .to_string(),
+            model_solution:
+                "The & operator yields the address of its operand; aliasing needs care.".to_string(),
         }
     }
 
@@ -478,9 +488,12 @@ mod tests {
         assert!(validate_grade(&short.to_string(), &rubric()).is_err());
         // Extra unknown criterion.
         let mut extra = good_grade();
-        extra["criteria_results"].as_array_mut().unwrap().push(serde_json::json!(
-            {"name": "style", "score": 1, "max_score": 1, "comment": "Neat."}
-        ));
+        extra["criteria_results"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(
+                {"name": "style", "score": 1, "max_score": 1, "comment": "Neat."}
+            ));
         assert!(validate_grade(&extra.to_string(), &rubric()).is_err());
         // Echoed max must match the frozen rubric (no invented totals).
         let mut wrong_max = good_grade();
@@ -531,7 +544,10 @@ mod tests {
         // Malformed rubrics fail loudly (never silently graded).
         assert!(parse_rubric_json("{\"criteria\": []}").is_err());
         assert!(parse_rubric_json("{broken").is_err());
-        assert!(parse_rubric_json("{\"criteria\": [{}], \"max_score\": 1, \"model_solution\": \"x\"}").is_err());
+        assert!(
+            parse_rubric_json("{\"criteria\": [{}], \"max_score\": 1, \"model_solution\": \"x\"}")
+                .is_err()
+        );
     }
 
     #[test]
@@ -568,7 +584,10 @@ mod tests {
     fn grade_identity_is_stable_and_sensitive() {
         let first = grade_source_hash("q", "{\"max_score\": 8}", "a");
         assert_eq!(first, grade_source_hash("q", "{\"max_score\": 8}", "a"));
-        assert_ne!(first, grade_source_hash("q", "{\"max_score\": 8}", "revised"));
+        assert_ne!(
+            first,
+            grade_source_hash("q", "{\"max_score\": 8}", "revised")
+        );
         assert_ne!(first, grade_source_hash("q2", "{\"max_score\": 8}", "a"));
         assert!(grade_params_json_for(&rubric()).contains("\"operation\":\"grade\""));
         assert!(grade_params_json_for(&rubric()).contains("\"max_tokens\":4000"));
@@ -582,11 +601,29 @@ mod tests {
         let criteria = schema["properties"]["criteria_results"].clone();
         assert_eq!(criteria["minItems"], serde_json::json!(2));
         assert_eq!(criteria["maxItems"], serde_json::json!(2));
-        assert_eq!(criteria["prefixItems"][0]["properties"]["name"]["enum"][0], serde_json::json!("correctness"));
-        assert_eq!(criteria["prefixItems"][0]["properties"]["max_score"]["enum"][0], serde_json::json!(5));
-        assert_eq!(criteria["prefixItems"][1]["properties"]["score"]["maximum"], serde_json::json!(3));
-        assert_eq!(schema["properties"]["score"]["maximum"], serde_json::json!(8));
-        assert_eq!(schema["properties"]["classification"]["enum"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            criteria["prefixItems"][0]["properties"]["name"]["enum"][0],
+            serde_json::json!("correctness")
+        );
+        assert_eq!(
+            criteria["prefixItems"][0]["properties"]["max_score"]["enum"][0],
+            serde_json::json!(5)
+        );
+        assert_eq!(
+            criteria["prefixItems"][1]["properties"]["score"]["maximum"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            schema["properties"]["score"]["maximum"],
+            serde_json::json!(8)
+        );
+        assert_eq!(
+            schema["properties"]["classification"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
         // The params tag tracks the schema: different rubrics, different tags.
         let tag = crate::llm::schema_tag(&grade_response_schema(&rubric()));
         assert!(grade_params_json_for(&rubric()).contains(&tag));

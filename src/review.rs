@@ -12,7 +12,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::domain::ChapterStatus;
-use crate::mcq::{ReviewConcept, MAX_QUESTIONS};
+use crate::mcq::{MAX_QUESTIONS, ReviewConcept};
 
 /// Completion-token cap for review generation calls (a full 12-Q JSON must
 /// fit — mirrors the MCQ pipeline cap).
@@ -82,10 +82,7 @@ pub fn is_open(status: &str) -> bool {
 /// re-probe, not the cumulative review.
 #[must_use]
 pub const fn is_eligible(status: ChapterStatus) -> bool {
-    matches!(
-        status,
-        ChapterStatus::Completed | ChapterStatus::Skipped
-    )
+    matches!(status, ChapterStatus::Completed | ChapterStatus::Skipped)
 }
 
 /// Select re-probe targets across chapters (§12): open rows on eligible
@@ -99,8 +96,11 @@ pub fn select_targets(chapters: &[ChapterOpen]) -> Vec<ReviewTarget> {
         if !is_eligible(chapter.status) {
             continue;
         }
-        let mut open: Vec<&MisconceptionView> =
-            chapter.rows.iter().filter(|row| is_open(&row.status)).collect();
+        let mut open: Vec<&MisconceptionView> = chapter
+            .rows
+            .iter()
+            .filter(|row| is_open(&row.status))
+            .collect();
         open.sort_by(|a, b| {
             a.confidence
                 .total_cmp(&b.confidence)
@@ -249,7 +249,11 @@ mod tests {
     #[test]
     fn selection_skips_live_chapters_and_keeps_order() {
         let chapters = vec![
-            chapter(1, ChapterStatus::Completed, vec![row(1, "a", "ACTIVE", 0.5)]),
+            chapter(
+                1,
+                ChapterStatus::Completed,
+                vec![row(1, "a", "ACTIVE", 0.5)],
+            ),
             chapter(
                 2,
                 ChapterStatus::RetestComplete,
@@ -259,10 +263,7 @@ mod tests {
             chapter(4, ChapterStatus::Locked, vec![row(4, "d", "ACTIVE", 0.1)]),
         ];
         let targets = select_targets(&chapters);
-        assert_eq!(
-            targets.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![1, 3]
-        );
+        assert_eq!(targets.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 3]);
     }
 
     #[test]
@@ -290,7 +291,11 @@ mod tests {
 
     #[test]
     fn target_hash_is_stable_and_sensitive() {
-        let chapters = vec![chapter(1, ChapterStatus::Completed, vec![row(1, "a", "ACTIVE", 0.5)])];
+        let chapters = vec![chapter(
+            1,
+            ChapterStatus::Completed,
+            vec![row(1, "a", "ACTIVE", 0.5)],
+        )];
         let targets = select_targets(&chapters);
         let again = select_targets(&chapters);
         assert_eq!(targets_hash(&targets), targets_hash(&again));

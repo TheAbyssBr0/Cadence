@@ -57,7 +57,11 @@ pub const fn status_for(confidence: f64) -> &'static str {
 /// confidence degrades to the floor, never propagates).
 #[must_use]
 pub fn apply_outcome(confidence: f64, status: &str, correct: bool, major: bool) -> Transition {
-    let delta = if major { ASSIGNMENT_DELTA } else { RETEST_DELTA };
+    let delta = if major {
+        ASSIGNMENT_DELTA
+    } else {
+        RETEST_DELTA
+    };
     let stepped = if correct {
         confidence + delta
     } else {
@@ -84,9 +88,7 @@ pub fn apply_outcome(confidence: f64, status: &str, correct: bool, major: bool) 
 #[must_use]
 pub const fn should_log_assignment_misconception(classification: GradeClass) -> bool {
     match classification {
-        GradeClass::Incorrect
-        | GradeClass::PartiallyCorrect
-        | GradeClass::Ambiguous => true,
+        GradeClass::Incorrect | GradeClass::PartiallyCorrect | GradeClass::Ambiguous => true,
         GradeClass::Correct
         | GradeClass::CorrectButBrief
         | GradeClass::Unanswered

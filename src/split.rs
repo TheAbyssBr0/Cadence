@@ -77,18 +77,18 @@ fn grouped_entries(
     }
     // Stable sort by page; grouping below keeps document order within a page.
     let mut sorted: Vec<UnitBoundary> = boundaries.to_vec();
-    sorted.sort_by(|a, b| a.page.cmp(&b.page));
+    sorted.sort_by_key(|b| b.page);
     let mut grouped: Vec<Entry> = Vec::new();
     for boundary in &sorted {
         match grouped.last() {
             Some(last) if last.page == boundary.page => {
                 // Same-page duplicate: keep the shallowest opener (and the
                 // first on ties) so the unit heading names the section.
-                if boundary.level < last.level {
-                    if let Some(slot) = grouped.last_mut() {
-                        slot.heading.clone_from(&boundary.heading);
-                        slot.level = boundary.level;
-                    }
+                if boundary.level < last.level
+                    && let Some(slot) = grouped.last_mut()
+                {
+                    slot.heading.clone_from(&boundary.heading);
+                    slot.level = boundary.level;
                 }
             }
             _ => grouped.push(Entry {
@@ -120,8 +120,7 @@ fn sorted_levels(entries: &[Entry]) -> Vec<i64> {
 /// shallowest level (historical behavior).
 #[must_use]
 pub fn detect_chapter_level(boundaries: &[UnitBoundary], doc_end_page: i64) -> Option<i64> {
-    let mut ordered: Vec<&UnitBoundary> =
-        boundaries.iter().filter(|b| b.level >= 1).collect();
+    let mut ordered: Vec<&UnitBoundary> = boundaries.iter().filter(|b| b.level >= 1).collect();
     ordered.sort_by_key(|b| b.page);
     let mut levels: Vec<i64> = ordered.iter().map(|b| b.level).collect();
     levels.sort_unstable();
@@ -168,7 +167,10 @@ pub fn describe_levels(
         "Outline depths (entries at/after page {start_page}):"
     )];
     let mut per_level: BTreeMap<i64, Vec<&UnitBoundary>> = BTreeMap::new();
-    for boundary in boundaries.iter().filter(|b| b.level >= 1 && b.page >= start_page) {
+    for boundary in boundaries
+        .iter()
+        .filter(|b| b.level >= 1 && b.page >= start_page)
+    {
         per_level.entry(boundary.level).or_default().push(boundary);
     }
     if per_level.is_empty() {
@@ -216,6 +218,111 @@ pub fn plan_units(
     plan_units_at_level(boundaries, start_page, doc_end_page, max_unit_pages, None)
 }
 
+/// Resolve the chapter level: explicit (validated against the outline) or
+/// detected, falling back to the shallowest outline depth.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] on depths below 1 or when no outline
+/// entry sits at the requested depth.
+fn resolve_chapter_level(
+    entries: &[Entry],
+    boundaries: &[UnitBoundary],
+    doc_end_page: i64,
+    chapter_level: Option<i64>,
+) -> Result<i64> {
+    if let Some(level) = chapter_level {
+        if level < 1 {
+            return Err(Error::InvalidInput(format!(
+                "chapter level must be >= 1 (got {level})"
+            )));
+        }
+        if !entries.iter().any(|e| e.level == level) {
+            let available = sorted_levels(entries)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidInput(format!(
+                "no outline entries at depth {level}; available depths: {available}"
+            )));
+        }
+        return Ok(level);
+    }
+    let shallowest = entries.iter().map(|e| e.level).min().unwrap_or(1);
+    Ok(detect_chapter_level(boundaries, doc_end_page).unwrap_or(shallowest))
+}
+
+/// Bounds of one chapter-level span: opener page through the page before the
+/// next opener (or the document end). `None` when the span is empty.
+fn span_bounds(
+    entries: &[Entry],
+    starts: &[usize],
+    position: usize,
+    start_page: i64,
+    doc_end_page: i64,
+) -> Option<(i64, i64)> {
+    let start_index = starts.get(position).copied()?;
+    let span_start = if position == 0 {
+        start_page
+    } else {
+        entries.get(start_index).map_or(start_page, |e| e.page)
+    };
+    let span_end = starts
+        .get(position.saturating_add(1))
+        .and_then(|next| entries.get(*next))
+        .map_or(doc_end_page, |e| {
+            e.page.checked_sub(1).unwrap_or(doc_end_page)
+        });
+    (span_start <= span_end).then_some((span_start, span_end))
+}
+
+/// Plan one chapter-level span: kept whole when explicit or small, else split
+/// recursively at subchapter boundaries.
+///
+/// # Errors
+///
+/// Propagates [`Error::NeedsManual`] for oversized spans without subchapter
+/// boundaries.
+fn push_span_units(
+    entries: &[Entry],
+    span_start: i64,
+    span_end: i64,
+    strict: bool,
+    max_unit_pages: i64,
+    out: &mut Vec<PlannedUnit>,
+) -> Result<()> {
+    let owned: Vec<Entry> = entries
+        .iter()
+        .filter(|e| e.page >= span_start && e.page <= span_end)
+        .cloned()
+        .collect();
+    let Some(head) = owned.first() else {
+        return Ok(());
+    };
+    if strict {
+        out.push(PlannedUnit {
+            heading: head.heading.clone(),
+            level: head.level,
+            start_page: span_start,
+            end_page: span_end,
+        });
+        return Ok(());
+    }
+    let opener = if head.page > span_start {
+        let mut with_opener = vec![Entry {
+            heading: head.heading.clone(),
+            level: head.level,
+            page: span_start,
+        }];
+        with_opener.extend(owned);
+        with_opener
+    } else {
+        owned
+    };
+    split_span(&opener, span_start, span_end, max_unit_pages, out)
+}
+
 /// Tile `[start_page, doc_end_page]` with study units at an explicit outline
 /// depth: units open at every entry at `chapter_level` or shallower and run
 /// to the next such entry, keeping oversized spans whole — the page cap and
@@ -254,27 +361,7 @@ pub fn plan_units_at_level(
     // Each span then splits recursively only if it exceeds the cap —
     // unless the level was chosen explicitly, which keeps spans whole.
     let strict = chapter_level.is_some();
-    let chapter_level = if let Some(level) = chapter_level {
-        if level < 1 {
-            return Err(Error::InvalidInput(format!(
-                "chapter level must be >= 1 (got {level})"
-            )));
-        }
-        if !entries.iter().any(|e| e.level == level) {
-            let available = sorted_levels(&entries)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::InvalidInput(format!(
-                "no outline entries at depth {level}; available depths: {available}"
-            )));
-        }
-        level
-    } else {
-        let shallowest = entries.iter().map(|e| e.level).min().unwrap_or(1);
-        detect_chapter_level(boundaries, doc_end_page).unwrap_or(shallowest)
-    };
+    let chapter_level = resolve_chapter_level(&entries, boundaries, doc_end_page, chapter_level)?;
     let mut starts: Vec<usize> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if entry.level <= chapter_level {
@@ -286,50 +373,20 @@ pub fn plan_units_at_level(
             "no outline boundaries to split".to_string(),
         ));
     }
-    for (position, start_index) in starts.iter().enumerate() {
-        let span_start = if position == 0 {
-            start_page
-        } else {
-            entries
-                .get(*start_index)
-                .map_or(start_page, |e| e.page)
-        };
-        let span_end = starts
-            .get(position.saturating_add(1))
-            .and_then(|next| entries.get(*next))
-            .map_or(doc_end_page, |e| e.page.checked_sub(1).unwrap_or(doc_end_page));
-        if span_start > span_end {
-            continue;
-        }
-        let owned: Vec<Entry> = entries
-            .iter()
-            .filter(|e| e.page >= span_start && e.page <= span_end)
-            .cloned()
-            .collect();
-        let Some(head) = owned.first() else {
+    for position in 0..starts.len() {
+        let Some((span_start, span_end)) =
+            span_bounds(&entries, &starts, position, start_page, doc_end_page)
+        else {
             continue;
         };
-        if strict {
-            out.push(PlannedUnit {
-                heading: head.heading.clone(),
-                level: head.level,
-                start_page: span_start,
-                end_page: span_end,
-            });
-            continue;
-        }
-        let opener = if head.page > span_start {
-            let mut with_opener = vec![Entry {
-                heading: head.heading.clone(),
-                level: head.level,
-                page: span_start,
-            }];
-            with_opener.extend(owned);
-            with_opener
-        } else {
-            owned
-        };
-        split_span(&opener, span_start, span_end, max_unit_pages, &mut out)?;
+        push_span_units(
+            &entries,
+            span_start,
+            span_end,
+            strict,
+            max_unit_pages,
+            &mut out,
+        )?;
     }
     verify_coverage(&out, start_page, doc_end_page)?;
     Ok(out)
@@ -421,11 +478,7 @@ fn split_span(
 /// Confirm the plan tiles `[start_page, doc_end_page]` with no gaps or
 /// overlaps — the corpus must always answer *"Where did this claim come
 /// from?"*, which requires contiguous unit coverage.
-fn verify_coverage(
-    units: &[PlannedUnit],
-    start_page: i64,
-    doc_end_page: i64,
-) -> Result<()> {
+fn verify_coverage(units: &[PlannedUnit], start_page: i64, doc_end_page: i64) -> Result<()> {
     let Some(first) = units.first() else {
         return Err(Error::InvalidInput("split produced no units".to_string()));
     };
@@ -445,7 +498,8 @@ fn verify_coverage(
         }
         if unit.end_page < unit.start_page {
             return Err(Error::InvalidInput(format!(
-                "unit '{}' has an inverted range", unit.heading
+                "unit '{}' has an inverted range",
+                unit.heading
             )));
         }
         let Some(next) = unit.end_page.checked_add(1) else {
@@ -715,10 +769,7 @@ mod tests {
     fn auto_mode_splits_fitting_part_divider() {
         let units = plan_units(&part_book(), 18, 60, 50).unwrap();
         let headings: Vec<&str> = units.iter().map(|u| u.heading.as_str()).collect();
-        assert_eq!(
-            headings,
-            vec!["Level 0", "ch 1", "ch 2", "Level 1", "ch 3"]
-        );
+        assert_eq!(headings, vec!["Level 0", "ch 1", "ch 2", "Level 1", "ch 3"]);
         assert_eq!((units[0].start_page, units[0].end_page), (18, 19));
         assert_eq!((units[1].start_page, units[1].end_page), (20, 27));
     }
@@ -761,7 +812,10 @@ mod tests {
         assert!(table.contains("level 1: 2 entries"), "table:\n{table}");
         assert!(table.contains("level 2: 3 entries"), "table:\n{table}");
         assert!(table.contains("level 3: 5 entries"), "table:\n{table}");
-        assert!(table.contains("Detected chapter level: 2"), "table:\n{table}");
+        assert!(
+            table.contains("Detected chapter level: 2"),
+            "table:\n{table}"
+        );
         let explicit = describe_levels(&part_book(), 18, 60, Some(3));
         assert!(
             explicit.contains("Using chapter level: 3 (explicit; page cap ignored)"),

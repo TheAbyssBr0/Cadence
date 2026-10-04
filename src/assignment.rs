@@ -247,11 +247,53 @@ pub fn build_assignment_prompt(unit: &UnitText, misconceptions: &[OpenMisconcept
     } else {
         prompt.push_str("\n\nOPEN MISCONCEPTIONS (at least 1-2 questions must re-probe these via target_misconception_ids):\n");
         for item in misconceptions {
-            // `write!` on a `String` never fails; the result is discarded.
-            let _ = write!(prompt, "- id {}: {}\n", item.id, item.concept);
+            // `writeln!` on a `String` never fails; the result is discarded.
+            let _ = writeln!(prompt, "- id {}: {}", item.id, item.concept);
         }
     }
     prompt
+}
+
+/// Validate one rubric criterion: named, scored ≥ 1, with a "good" sketch.
+///
+/// # Errors
+///
+/// Returns [`Error::LlmFatal`] describing the defect.
+fn validate_criterion(raw: &serde_json::Value, position: usize, index: usize) -> Result<Criterion> {
+    let name = raw
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::LlmFatal(format!(
+                "question {position}: criterion {index} needs a name"
+            ))
+        })?;
+    let max_score = raw
+        .get("max_score")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|s| *s >= 1)
+        .ok_or_else(|| {
+            Error::LlmFatal(format!(
+                "question {position}: criterion {index} needs max_score >= 1"
+            ))
+        })?;
+    let what_good = raw
+        .get("what_good_looks_like")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::LlmFatal(format!(
+                "question {position}: criterion {index} needs what_good_looks_like"
+            ))
+        })?;
+    Ok(Criterion {
+        name: name.to_string(),
+        max_score,
+        what_good_looks_like: what_good.to_string(),
+    })
 }
 
 /// Validate one rubric: criteria present and scored, solution substantial.
@@ -266,9 +308,11 @@ fn validate_rubric(value: &serde_json::Value, position: usize) -> Result<Rubric>
             Error::LlmFatal(format!("question {position}: rubric missing '{field}'"))
         })
     };
-    let criteria_raw = get("criteria")?
-        .as_array()
-        .ok_or_else(|| Error::LlmFatal(format!("question {position}: rubric criteria must be an array")))?;
+    let criteria_raw = get("criteria")?.as_array().ok_or_else(|| {
+        Error::LlmFatal(format!(
+            "question {position}: rubric criteria must be an array"
+        ))
+    })?;
     if criteria_raw.is_empty() {
         return Err(Error::LlmFatal(format!(
             "question {position}: rubric needs at least 1 criterion"
@@ -276,38 +320,7 @@ fn validate_rubric(value: &serde_json::Value, position: usize) -> Result<Rubric>
     }
     let mut criteria = Vec::with_capacity(criteria_raw.len());
     for (index, raw) in criteria_raw.iter().enumerate() {
-        let name = raw
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::LlmFatal(format!("question {position}: criterion {index} needs a name"))
-            })?;
-        let max_score = raw
-            .get("max_score")
-            .and_then(serde_json::Value::as_i64)
-            .filter(|s| *s >= 1)
-            .ok_or_else(|| {
-                Error::LlmFatal(format!(
-                    "question {position}: criterion {index} needs max_score >= 1"
-                ))
-            })?;
-        let what_good = raw
-            .get("what_good_looks_like")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::LlmFatal(format!(
-                    "question {position}: criterion {index} needs what_good_looks_like"
-                ))
-            })?;
-        criteria.push(Criterion {
-            name: name.to_string(),
-            max_score,
-            what_good_looks_like: what_good.to_string(),
-        });
+        criteria.push(validate_criterion(raw, position, index)?);
     }
     let max_score = get("max_score")?
         .as_i64()
@@ -320,7 +333,9 @@ fn validate_rubric(value: &serde_json::Value, position: usize) -> Result<Rubric>
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            Error::LlmFatal(format!("question {position}: rubric needs a model_solution"))
+            Error::LlmFatal(format!(
+                "question {position}: rubric needs a model_solution"
+            ))
         })?;
     if solution.chars().count() < MIN_SOLUTION_CHARS {
         return Err(Error::LlmFatal(format!(
@@ -345,9 +360,9 @@ fn validate_source_refs(
     position: usize,
     unit: &UnitText,
 ) -> Result<SourceRefs> {
-    let refs = value.get("source_refs").ok_or_else(|| {
-        Error::LlmFatal(format!("question {position}: missing source_refs"))
-    })?;
+    let refs = value
+        .get("source_refs")
+        .ok_or_else(|| Error::LlmFatal(format!("question {position}: missing source_refs")))?;
     let pages: Vec<i64> = refs
         .get("pages")
         .and_then(serde_json::Value::as_array)
@@ -384,25 +399,17 @@ fn validate_source_refs(
     Ok(SourceRefs { pages, sections })
 }
 
-/// Validate one raw question object: kind, parts, closed-book wording,
-/// creation-time rubric, provenance, misconception targets, coding cap.
-/// Returns the question plus whether it re-probes an open misconception.
+/// Validate a question's parts: count per kind plus closed-book wording
+/// (no pointers at book content in any part).
 ///
 /// # Errors
 ///
 /// Returns [`Error::LlmFatal`] on the first defect found.
-fn validate_one_question(
+fn validate_question_parts(
     raw: &serde_json::Value,
+    kind: QuestionKind,
     position: usize,
-    unit: &UnitText,
-    open: &[OpenMisconception],
-) -> Result<(ValidatedQuestion, bool)> {
-    let kind_label = raw
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Error::LlmFatal(format!("question {position}: missing kind")))?;
-    let kind = QuestionKind::parse(kind_label)
-        .map_err(|_| Error::LlmFatal(format!("question {position}: bad kind '{kind_label}'")))?;
+) -> Result<Vec<String>> {
     let parts: Vec<String> = raw
         .get("parts")
         .and_then(serde_json::Value::as_array)
@@ -437,11 +444,20 @@ fn validate_one_question(
             "question {position}: closed-book violation ({hit}) — inline the excerpt instead"
         )));
     }
-    let rubric = raw
-        .get("rubric")
-        .ok_or_else(|| Error::LlmFatal(format!("question {position}: missing rubric")))?;
-    let rubric = validate_rubric(rubric, position)?;
-    let source_refs = validate_source_refs(raw, position, unit)?;
+    Ok(parts)
+}
+
+/// Validate misconception re-probe targets: every id must be open. Returns
+/// the targets plus whether this question re-probes anything.
+///
+/// # Errors
+///
+/// Returns [`Error::LlmFatal`] on unknown ids.
+fn validate_reprobe_targets(
+    raw: &serde_json::Value,
+    position: usize,
+    open: &[OpenMisconception],
+) -> Result<(Vec<i64>, bool)> {
     let targets: Vec<i64> = raw
         .get("target_misconception_ids")
         .and_then(serde_json::Value::as_array)
@@ -455,6 +471,35 @@ fn validate_one_question(
         }
     }
     let reprobes = !targets.is_empty();
+    Ok((targets, reprobes))
+}
+
+/// Validate one raw question object: kind, parts, closed-book wording,
+/// creation-time rubric, provenance, misconception targets, coding cap.
+/// Returns the question plus whether it re-probes an open misconception.
+///
+/// # Errors
+///
+/// Returns [`Error::LlmFatal`] on the first defect found.
+fn validate_one_question(
+    raw: &serde_json::Value,
+    position: usize,
+    unit: &UnitText,
+    open: &[OpenMisconception],
+) -> Result<(ValidatedQuestion, bool)> {
+    let kind_label = raw
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::LlmFatal(format!("question {position}: missing kind")))?;
+    let kind = QuestionKind::parse(kind_label)
+        .map_err(|_| Error::LlmFatal(format!("question {position}: bad kind '{kind_label}'")))?;
+    let parts = validate_question_parts(raw, kind, position)?;
+    let rubric = raw
+        .get("rubric")
+        .ok_or_else(|| Error::LlmFatal(format!("question {position}: missing rubric")))?;
+    let rubric = validate_rubric(rubric, position)?;
+    let source_refs = validate_source_refs(raw, position, unit)?;
+    let (targets, reprobes) = validate_reprobe_targets(raw, position, open)?;
     let estimated_loc = match kind {
         QuestionKind::Written => None,
         QuestionKind::Coding => {
@@ -464,7 +509,7 @@ fn validate_one_question(
                 .ok_or_else(|| {
                     Error::LlmFatal(format!("question {position}: coding needs estimated_loc"))
                 })?;
-            if loc < 1 || loc > MAX_ESTIMATED_LOC {
+            if !(1..=MAX_ESTIMATED_LOC).contains(&loc) {
                 return Err(Error::LlmFatal(format!(
                     "question {position}: estimated_loc {loc} exceeds the {MAX_ESTIMATED_LOC}-LOC cap"
                 )));
@@ -522,7 +567,7 @@ pub fn validate_assignment_set(
         }
         out.push(question);
     }
-    if written_count < MIN_WRITTEN || written_count > MAX_WRITTEN {
+    if !(MIN_WRITTEN..=MAX_WRITTEN).contains(&written_count) {
         return Err(Error::LlmFatal(format!(
             "assignment needs {MIN_WRITTEN}-{MAX_WRITTEN} written questions, got {written_count}"
         )));
@@ -589,7 +634,8 @@ mod tests {
 
     fn unit() -> UnitText {
         UnitText {
-            text: "Pointers hold addresses. The & operator takes an address. Dereference with *.".to_string(),
+            text: "Pointers hold addresses. The & operator takes an address. Dereference with *."
+                .to_string(),
             page_start: 10,
             page_end: 20,
             heading: "Pointers".to_string(),
@@ -654,7 +700,10 @@ mod tests {
 
     #[test]
     fn kind_round_trip() {
-        assert_eq!(QuestionKind::parse("written").unwrap(), QuestionKind::Written);
+        assert_eq!(
+            QuestionKind::parse("written").unwrap(),
+            QuestionKind::Written
+        );
         assert_eq!(QuestionKind::parse("coding").unwrap(), QuestionKind::Coding);
         assert!(QuestionKind::parse("quiz").is_err());
         assert_eq!(QuestionKind::Coding.as_str(), "coding");
@@ -688,7 +737,10 @@ mod tests {
     fn rubric_and_solution_gates() {
         // Missing rubric.
         let mut set = good_set();
-        set["questions"][0].as_object_mut().unwrap().remove("rubric");
+        set["questions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("rubric");
         assert!(validate_assignment_set(&set.to_string(), &unit(), &open()).is_err());
         // Stub solution.
         let mut stub = good_set();
@@ -755,11 +807,19 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(&assignment_response_schema()).unwrap();
         let item = &schema["properties"]["questions"]["items"];
-        assert_eq!(item["properties"]["kind"]["enum"], serde_json::json!(["written", "coding"]));
+        assert_eq!(
+            item["properties"]["kind"]["enum"],
+            serde_json::json!(["written", "coding"])
+        );
         assert_eq!(item["required"].as_array().unwrap().len(), 6);
         // `estimated_loc` is required on every question (0 for written) so
         // strict mode accepts the shape; the validator ignores written values.
-        assert!(item["required"].as_array().unwrap().contains(&serde_json::json!("estimated_loc")));
+        assert!(
+            item["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("estimated_loc"))
+        );
         assert_eq!(
             item["properties"]["rubric"]["properties"]["criteria"]["minItems"],
             serde_json::json!(1)

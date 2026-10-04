@@ -164,7 +164,10 @@ pub fn format_percent(value: Option<f64>) -> String {
 /// Display an evidence fraction with its percent: `5/8 (63%)`, `0/0 (n/a)`.
 #[must_use]
 pub fn format_fraction(earned: u64, possible: u64) -> String {
-    format!("{earned}/{possible} ({})", format_percent(percent(earned, possible)))
+    format!(
+        "{earned}/{possible} ({})",
+        format_percent(percent(earned, possible))
+    )
 }
 
 /// Streaks from completion dates. Future dates are ignored (defensive —
@@ -195,9 +198,11 @@ pub fn consistency(active_days: &[NaiveDate], today: NaiveDate) -> Consistency {
     // The streak is alive when the latest active day is today or yesterday.
     let mut current = 0_usize;
     let yesterday = today.checked_sub_days(chrono::Days::new(1));
-    if let Some(mut cursor) = days.last().copied().filter(|last| {
-        *last == today || yesterday.is_some_and(|prior| *last == prior)
-    }) {
+    if let Some(mut cursor) = days
+        .last()
+        .copied()
+        .filter(|last| *last == today || yesterday.is_some_and(|prior| *last == prior))
+    {
         for day in days.iter().rev() {
             if *day != cursor {
                 break;
@@ -236,11 +241,7 @@ pub fn on_time_percent(punctual: &[(NaiveDate, NaiveDate)]) -> Option<f64> {
 /// `remaining_units`. `None` ETA means unknown (no window completions);
 /// `Some(today)` means nothing is left.
 #[must_use]
-pub fn pace(
-    completions: &[(NaiveDate, u64)],
-    today: NaiveDate,
-    remaining_units: usize,
-) -> Pace {
+pub fn pace(completions: &[(NaiveDate, u64)], today: NaiveDate, remaining_units: usize) -> Pace {
     let window_start = today
         .checked_sub_days(chrono::Days::new(6))
         .unwrap_or(today);

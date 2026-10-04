@@ -733,13 +733,19 @@ pub trait Store {
     /// # Errors
     ///
     /// Returns [`Error::Store`] on backend failure.
-    fn delete_mcq_items_for(&mut self, chapter_id: i64, phase: &str, attempt_no: i64) -> Result<usize>;
+    fn delete_mcq_items_for(
+        &mut self,
+        chapter_id: i64,
+        phase: &str,
+        attempt_no: i64,
+    ) -> Result<usize>;
     /// All MCQ items for a chapter/phase/attempt, in insertion order.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Store`] on backend failure.
-    fn list_mcq_items(&self, chapter_id: i64, phase: &str, attempt_no: i64) -> Result<Vec<McqItem>>;
+    fn list_mcq_items(&self, chapter_id: i64, phase: &str, attempt_no: i64)
+    -> Result<Vec<McqItem>>;
     /// Record one MCQ answer.
     ///
     /// # Errors
@@ -766,7 +772,6 @@ pub trait Store {
     /// # Errors
     ///
     /// Returns [`Error::Store`] on backend failure.
-    #[allow(clippy::too_many_arguments)]
     fn create_misconception(
         &mut self,
         chapter_id: i64,
@@ -830,7 +835,13 @@ pub trait Store {
     /// # Errors
     ///
     /// Returns [`Error::Store`] on backend failure.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "exercised only by unit tests; unreachable in production builds"
+        )
+    )]
     fn delete_assignment_questions_for(
         &mut self,
         chapter_id: i64,
@@ -893,7 +904,13 @@ pub trait Store {
     /// # Errors
     ///
     /// Returns [`Error::Store`] on backend failure.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "exercised only by unit tests; unreachable in production builds"
+        )
+    )]
     fn list_disputes_for_grade(&self, grade_id: i64) -> Result<Vec<Dispute>>;
     /// Persist one post-grading chapter-notes document (§11).
     ///
@@ -971,9 +988,10 @@ impl MemoryStore {
     /// Returns [`Error::Store`] on `i64` overflow (practically unreachable).
     fn alloc_id(&mut self) -> Result<i64> {
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
-            Error::Store("id sequence overflow".to_string())
-        })?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| Error::Store("id sequence overflow".to_string()))?;
         Ok(id)
     }
 }
@@ -1131,9 +1149,7 @@ impl Store for MemoryStore {
 
     fn set_chapter_attempt(&mut self, id: i64, attempt_no: i64) -> Result<()> {
         if attempt_no < 1 {
-            return Err(Error::InvalidInput(
-                "attempt_no must be >= 1".to_string(),
-            ));
+            return Err(Error::InvalidInput("attempt_no must be >= 1".to_string()));
         }
         let chapter = self
             .chapters
@@ -1315,7 +1331,9 @@ impl Store for MemoryStore {
         let mut out: Vec<McqItem> = self
             .mcq_items
             .values()
-            .filter(|m| m.chapter_id == chapter_id && m.phase == phase && m.attempt_no == attempt_no)
+            .filter(|m| {
+                m.chapter_id == chapter_id && m.phase == phase && m.attempt_no == attempt_no
+            })
             .cloned()
             .collect();
         out.sort_by_key(|m| m.id);
@@ -1331,14 +1349,17 @@ impl Store for MemoryStore {
         let ids: Vec<i64> = self
             .mcq_items
             .values()
-            .filter(|m| m.chapter_id == chapter_id && m.phase == phase && m.attempt_no == attempt_no)
+            .filter(|m| {
+                m.chapter_id == chapter_id && m.phase == phase && m.attempt_no == attempt_no
+            })
             .map(|m| m.id)
             .collect();
         let count = ids.len();
         for id in &ids {
             self.mcq_items.remove(id);
         }
-        self.mcq_responses.retain(|_, r| !ids.contains(&r.mcq_item_id));
+        self.mcq_responses
+            .retain(|_, r| !ids.contains(&r.mcq_item_id));
         Ok(count)
     }
 
@@ -1686,6 +1707,32 @@ pub struct SqliteStore {
     _path: PathBuf,
 }
 
+/// Row tuples for the wide chapter/task/cache selects (keeps `query_row`
+/// annotations under the complexity limit).
+type ChapterRow = (i64, i64, i64, i64, String, i64, i64, String, String, i64);
+type TaskRow = (
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    i64,
+);
+type LlmCacheRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
 impl SqliteStore {
     /// Open (creating parent directories as needed) at `db_path`, acquiring
     /// `lock_path` exclusively first. Uses a transaction for schema setup and
@@ -1696,24 +1743,24 @@ impl SqliteStore {
     /// Returns [`Error::AlreadyOpen`] when another process holds the lock,
     /// [`Error::Store`] on SQLite failures.
     pub fn open(db_path: &Path, lock_path: &Path) -> Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
-        if let Some(parent) = lock_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;
-        lock.try_lock_exclusive().map_err(|_| {
-            Error::AlreadyOpen(format!("database locked: {}", lock_path.display()))
-        })?;
+        lock.try_lock_exclusive()
+            .map_err(|_| Error::AlreadyOpen(format!("database locked: {}", lock_path.display())))?;
         let conn = Connection::open(db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Self::ensure_version(&conn)?;
@@ -1732,12 +1779,11 @@ impl SqliteStore {
     /// scratch lock file cannot be created.
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
-        let lock_path = std::env::temp_dir().join(format!(
-            "cadence-test-{}.lock",
-            std::process::id()
-        ));
+        let lock_path =
+            std::env::temp_dir().join(format!("cadence-test-{}.lock", std::process::id()));
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -1802,7 +1848,10 @@ impl SqliteStore {
     /// # Errors
     ///
     /// Returns [`Error::Store`] on SQLite failures.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential version-gated migration steps; one branch per schema version"
+    )]
     fn migrate(conn: &Connection, from: i64) -> Result<()> {
         if from <= 1 {
             // v1 → v2: attempt tracking + MCQ + misconception tables (§4.1, §7.1, §12).
@@ -1939,7 +1988,11 @@ impl SqliteStore {
             // is exact, not a guess; pre-`attempt_no` rows are first
             // attempts by construction.
             for (table, column, ddl) in [
-                ("misconceptions", "concept_description", "TEXT NOT NULL DEFAULT ''"),
+                (
+                    "misconceptions",
+                    "concept_description",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
                 ("misconceptions", "updated_at", "TEXT NOT NULL DEFAULT ''"),
                 ("mcq_items", "attempt_no", "INTEGER NOT NULL DEFAULT 1"),
                 ("mcq_responses", "attempt_no", "INTEGER NOT NULL DEFAULT 1"),
@@ -1961,9 +2014,7 @@ impl SqliteStore {
                 ("notes", "attempt_no", "INTEGER NOT NULL DEFAULT 1"),
             ] {
                 if !Self::column_exists(conn, table, column)? {
-                    conn.execute_batch(&format!(
-                        "ALTER TABLE {table} ADD COLUMN {column} {ddl};"
-                    ))?;
+                    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};"))?;
                 }
             }
             // `updated_at` did not exist when old rows were written: inherit
@@ -2081,7 +2132,7 @@ impl Store for SqliteStore {
     }
 
     fn get_chapter(&self, id: i64) -> Result<Chapter> {
-        let row: Option<(i64, i64, i64, i64, String, i64, i64, String, String, i64)> = self
+        let row: Option<ChapterRow> = self
             .conn
             .query_row(
                 "SELECT id, book_id, index_in_book, level, title, start_page, end_page, file_path, status, attempt_no FROM chapters WHERE id = ?1",
@@ -2193,9 +2244,7 @@ impl Store for SqliteStore {
 
     fn set_chapter_attempt(&mut self, id: i64, attempt_no: i64) -> Result<()> {
         if attempt_no < 1 {
-            return Err(Error::InvalidInput(
-                "attempt_no must be >= 1".to_string(),
-            ));
+            return Err(Error::InvalidInput("attempt_no must be >= 1".to_string()));
         }
         let changed = self.conn.execute(
             "UPDATE chapters SET attempt_no = ?1 WHERE id = ?2",
@@ -2249,17 +2298,7 @@ impl Store for SqliteStore {
     }
 
     fn get_task(&self, id: i64) -> Result<Task> {
-        let row: Option<(
-            i64,
-            i64,
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            i64,
-            i64,
-        )> = self
+        let row: Option<TaskRow> = self
             .conn
             .query_row(
                 "SELECT id, book_id, chapter_id, type, scheduled_for, status, completed_at, sequence, attempt_no FROM tasks WHERE id = ?1",
@@ -2339,28 +2378,37 @@ impl Store for SqliteStore {
                 sequence,
                 attempt_no,
             ) = row?;
-            let parsed_date = NaiveDate::parse_from_str(&scheduled_for, "%Y-%m-%d")
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))?;
+            let parsed_date =
+                NaiveDate::parse_from_str(&scheduled_for, "%Y-%m-%d").map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             out.push(Task {
                 id,
                 book_id,
                 chapter_id,
-                task_type: TaskType::parse(&kind)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                task_type: TaskType::parse(&kind).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
                         3,
                         rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-                    ))?,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )),
+                    )
+                })?,
                 scheduled_for: parsed_date,
                 status: TaskStatus::parse(&status).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         5,
                         rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )),
                     )
                 })?,
                 completed_at,
@@ -2463,7 +2511,7 @@ impl Store for SqliteStore {
     }
 
     fn get_llm_cache(&self, cache_hash: &str) -> Result<Option<LlmCacheEntry>> {
-        let row: Option<(String, String, String, String, String, String, String, String, String)> =
+        let row: Option<LlmCacheRow> =
             self.conn
                 .query_row(
                     "SELECT cache_hash, operation, provider, model, prompt_version, request_json, response_json, status, created_at FROM llm_cache WHERE cache_hash = ?1",
@@ -3368,7 +3416,11 @@ mod tests {
             .unwrap();
         let hit = store.get_llm_cache("h1").unwrap().unwrap();
         assert_eq!(hit.response_json, "ok");
-        assert!(store.record_llm_attempt(9999, 1, "FAILED", None, None, Some("x")).is_err());
+        assert!(
+            store
+                .record_llm_attempt(9999, 1, "FAILED", None, None, Some("x"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -3435,13 +3487,11 @@ mod tests {
                 chapter_id,
                 phase: "pretest".to_string(),
                 question_text: "What does &x yield?".to_string(),
-                options_json:
-                    "[\"addr\",\"value\",\"null\",\"dangling\"]".to_string(),
+                options_json: "[\"addr\",\"value\",\"null\",\"dangling\"]".to_string(),
                 correct_index: 0,
                 trap_index: 1,
                 explanation_text: "The & operator takes addresses plainly.".to_string(),
-                source_refs:
-                    "{\"pages\":[12],\"sections\":[\"Addresses\"]}".to_string(),
+                source_refs: "{\"pages\":[12],\"sections\":[\"Addresses\"]}".to_string(),
                 topic: "addresses".to_string(),
                 attempt_no: 1,
             },
@@ -3449,13 +3499,11 @@ mod tests {
                 chapter_id,
                 phase: "pretest".to_string(),
                 question_text: "What does *p read?".to_string(),
-                options_json:
-                    "[\"pointee\",\"address\",\"null\",\"type\"]".to_string(),
+                options_json: "[\"pointee\",\"address\",\"null\",\"type\"]".to_string(),
                 correct_index: 0,
                 trap_index: 2,
                 explanation_text: "Dereference reads the pointed-to value here.".to_string(),
-                source_refs:
-                    "{\"pages\":[13],\"sections\":[\"Deref\"]}".to_string(),
+                source_refs: "{\"pages\":[13],\"sections\":[\"Deref\"]}".to_string(),
                 topic: "deref".to_string(),
                 attempt_no: 1,
             },
@@ -3512,8 +3560,17 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert!(listed[0].id < listed[1].id);
         // Other phases/attempts are isolated.
-        assert_eq!(store.list_mcq_items(chapter.id, "retest", 1).unwrap().len(), 0);
-        assert_eq!(store.list_mcq_items(chapter.id, "pretest", 2).unwrap().len(), 0);
+        assert_eq!(
+            store.list_mcq_items(chapter.id, "retest", 1).unwrap().len(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_mcq_items(chapter.id, "pretest", 2)
+                .unwrap()
+                .len(),
+            0
+        );
         let response = store
             .record_mcq_response(saved[0].id, 0, true, false, "2026-01-05", 1)
             .unwrap();
@@ -3522,7 +3579,11 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_eq!(store.list_mcq_responses(saved[1].id).unwrap().len(), 0);
         // Unknown items fail loudly, never silently.
-        assert!(store.record_mcq_response(9999, 0, false, false, "2026-01-05", 1).is_err());
+        assert!(
+            store
+                .record_mcq_response(9999, 0, false, false, "2026-01-05", 1)
+                .is_err()
+        );
         // Bad attempt numbers are rejected.
         let mut bad = sample_mcq_items(chapter.id);
         bad[0].attempt_no = 0;
@@ -3569,11 +3630,25 @@ mod tests {
                     .unwrap(),
                 2
             );
-            assert_eq!(store.list_mcq_items(chapter.id, "pretest", 1).unwrap().len(), 0);
+            assert_eq!(
+                store
+                    .list_mcq_items(chapter.id, "pretest", 1)
+                    .unwrap()
+                    .len(),
+                0
+            );
             // Attached responses go with the items; other phases are untouched.
             assert_eq!(store.list_mcq_responses(saved[0].id).unwrap().len(), 0);
-            assert_eq!(store.list_mcq_items(chapter.id, "retest", 1).unwrap().len(), 1);
-            assert_eq!(store.delete_mcq_items_for(chapter.id, "pretest", 1).unwrap(), 0);
+            assert_eq!(
+                store.list_mcq_items(chapter.id, "retest", 1).unwrap().len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .delete_mcq_items_for(chapter.id, "pretest", 1)
+                    .unwrap(),
+                0
+            );
         }
     }
 
@@ -3595,18 +3670,49 @@ mod tests {
             assert_eq!(listed.len(), 4);
             assert!(listed.windows(2).all(|w| w[0].position <= w[1].position));
             // Attempts are isolated.
-            assert_eq!(store.list_assignment_questions(chapter.id, 2).unwrap().len(), 0);
+            assert_eq!(
+                store
+                    .list_assignment_questions(chapter.id, 2)
+                    .unwrap()
+                    .len(),
+                0
+            );
             let response = store
                 .record_assignment_response(saved[0].id, "my answer", "2026-01-07", 1)
                 .unwrap();
             assert_eq!(response.answer_text, "my answer");
-            assert_eq!(store.list_assignment_responses(saved[0].id).unwrap().len(), 1);
-            assert_eq!(store.list_assignment_responses(saved[1].id).unwrap().len(), 0);
+            assert_eq!(
+                store.list_assignment_responses(saved[0].id).unwrap().len(),
+                1
+            );
+            assert_eq!(
+                store.list_assignment_responses(saved[1].id).unwrap().len(),
+                0
+            );
             // Replace deletes questions and their responses together.
-            assert_eq!(store.delete_assignment_questions_for(chapter.id, 1).unwrap(), 4);
-            assert_eq!(store.list_assignment_questions(chapter.id, 1).unwrap().len(), 0);
-            assert_eq!(store.list_assignment_responses(saved[0].id).unwrap().len(), 0);
-            assert_eq!(store.delete_assignment_questions_for(chapter.id, 1).unwrap(), 0);
+            assert_eq!(
+                store
+                    .delete_assignment_questions_for(chapter.id, 1)
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                store
+                    .list_assignment_questions(chapter.id, 1)
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert_eq!(
+                store.list_assignment_responses(saved[0].id).unwrap().len(),
+                0
+            );
+            assert_eq!(
+                store
+                    .delete_assignment_questions_for(chapter.id, 1)
+                    .unwrap(),
+                0
+            );
             // Bad attempts and kinds are rejected loudly.
             let mut bad = sample_assignment_questions(chapter.id, 1);
             bad[0].attempt_no = 0;
@@ -3639,10 +3745,15 @@ mod tests {
             let listed = store.list_misconceptions(chapter.id).unwrap();
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].concept_description, "addresses");
-            assert_eq!(store.list_misconceptions(chapter.id + 999).unwrap().len(), 0);
-            assert!(store
-                .create_misconception(chapter.id, " ", "desc", "ev", "RETEST", "2026-01-06")
-                .is_err());
+            assert_eq!(
+                store.list_misconceptions(chapter.id + 999).unwrap().len(),
+                0
+            );
+            assert!(
+                store
+                    .create_misconception(chapter.id, " ", "desc", "ev", "RETEST", "2026-01-06")
+                    .is_err()
+            );
         }
     }
 
@@ -3685,15 +3796,41 @@ mod tests {
             assert_eq!(resolved.status, "RESOLVED");
             assert_eq!(resolved.resolved_at, Some("2026-01-08".to_string()));
             let kept = store
-                .update_misconception(row.id, 0.95, "RESOLVED", "2026-01-09", resolved.resolved_at.as_deref())
+                .update_misconception(
+                    row.id,
+                    0.95,
+                    "RESOLVED",
+                    "2026-01-09",
+                    resolved.resolved_at.as_deref(),
+                )
                 .unwrap();
             assert_eq!(kept.resolved_at, Some("2026-01-08".to_string()));
             // Bad inputs fail loudly on both backends.
-            assert!(store.update_misconception(row.id, -0.1, "ACTIVE", "2026-01-09", None).is_err());
-            assert!(store.update_misconception(row.id, 1.1, "ACTIVE", "2026-01-09", None).is_err());
-            assert!(store.update_misconception(row.id, f64::NAN, "ACTIVE", "2026-01-09", None).is_err());
-            assert!(store.update_misconception(row.id, 0.5, "STALE", "2026-01-09", None).is_err());
-            assert!(store.update_misconception(row.id + 999, 0.5, "ACTIVE", "2026-01-09", None).is_err());
+            assert!(
+                store
+                    .update_misconception(row.id, -0.1, "ACTIVE", "2026-01-09", None)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .update_misconception(row.id, 1.1, "ACTIVE", "2026-01-09", None)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .update_misconception(row.id, f64::NAN, "ACTIVE", "2026-01-09", None)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .update_misconception(row.id, 0.5, "STALE", "2026-01-09", None)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .update_misconception(row.id + 999, 0.5, "ACTIVE", "2026-01-09", None)
+                    .is_err()
+            );
         }
     }
 
@@ -3726,10 +3863,7 @@ mod tests {
             store.complete_task(task.id, "2026-01-10").unwrap();
             let done_err = store.reschedule_task(task.id, future).unwrap_err();
             assert!(matches!(done_err, Error::AlreadyCompleted(_)));
-            assert_eq!(
-                store.get_task(task.id).unwrap().scheduled_for,
-                today
-            );
+            assert_eq!(store.get_task(task.id).unwrap().scheduled_for, today);
             assert!(store.reschedule_task(task.id + 999, today).is_err());
         }
     }
@@ -3761,7 +3895,10 @@ mod tests {
             .unwrap();
         store.complete_task(first.id, "2026-01-05").unwrap();
         // Skip deletes only pending rows; completed work stays as audit trail.
-        assert_eq!(store.delete_pending_tasks_for_chapter(chapter.id).unwrap(), 1);
+        assert_eq!(
+            store.delete_pending_tasks_for_chapter(chapter.id).unwrap(),
+            1
+        );
         let remaining = store.list_tasks().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].status, TaskStatus::Done);
@@ -3771,8 +3908,13 @@ mod tests {
         assert!(store.set_chapter_attempt(chapter.id, 0).is_err());
         assert!(store.set_chapter_attempt(9999, 2).is_err());
         // Skipped chapters yield no next task.
-        store.set_chapter_status(chapter.id, ChapterStatus::Skipped).unwrap();
-        assert_eq!(store.get_chapter(chapter.id).unwrap().status.next_task(), None);
+        store
+            .set_chapter_status(chapter.id, ChapterStatus::Skipped)
+            .unwrap();
+        assert_eq!(
+            store.get_chapter(chapter.id).unwrap().status.next_task(),
+            None
+        );
     }
 
     /// Build a v1 database file (no `attempt_no`, no MCQ/assignment tables),
@@ -3780,13 +3922,9 @@ mod tests {
     /// chain (v1 → v2 → v3) preserves rows and lands on [`SCHEMA_VERSION`].
     #[test]
     fn migrates_v1_to_v2_preserving_rows() {
-        let dir: std::path::PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "migration-v1-test",
-        ]
-        .iter()
-        .collect();
+        let dir: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "migration-v1-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("cadence.db");
@@ -3811,7 +3949,9 @@ mod tests {
         let mut store = SqliteStore::open(&db_path, &lock_path).unwrap();
         let version: i64 = store
             .conn
-            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // Legacy rows survive with backfilled attempt 1.
@@ -3823,7 +3963,9 @@ mod tests {
         assert_eq!(saved.len(), 2);
         assert_eq!(store.list_mcq_items(1, "pretest", 1).unwrap().len(), 2);
         // New v3 writes work too (assignment tables arrived via the chain).
-        let questions = store.save_assignment_questions(&sample_assignment_questions(1, 1)).unwrap();
+        let questions = store
+            .save_assignment_questions(&sample_assignment_questions(1, 1))
+            .unwrap();
         assert_eq!(questions.len(), 4);
         assert_eq!(store.list_assignment_questions(1, 1).unwrap().len(), 4);
         // Reopen is idempotent (migration reruns safely).
@@ -3838,13 +3980,9 @@ mod tests {
     /// preserving existing rows.
     #[test]
     fn migrates_v2_to_v3_preserving_rows() {
-        let dir: std::path::PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "migration-v2-test",
-        ]
-        .iter()
-        .collect();
+        let dir: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "migration-v2-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("cadence.db");
@@ -3871,12 +4009,19 @@ mod tests {
         let mut store = SqliteStore::open(&db_path, &lock_path).unwrap();
         let version: i64 = store
             .conn
-            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // v2 rows survive; v3 tables accept writes.
-        assert_eq!(store.get_chapter(1).unwrap().status, ChapterStatus::ReadComplete);
-        let questions = store.save_assignment_questions(&sample_assignment_questions(1, 1)).unwrap();
+        assert_eq!(
+            store.get_chapter(1).unwrap().status,
+            ChapterStatus::ReadComplete
+        );
+        let questions = store
+            .save_assignment_questions(&sample_assignment_questions(1, 1))
+            .unwrap();
         assert_eq!(questions.len(), 4);
         drop(store);
         let store2 = SqliteStore::open(&db_path, &lock_path).unwrap();
@@ -3924,8 +4069,17 @@ mod tests {
             let saved = store.save_grade(&sample_grade(question_id)).unwrap();
             assert!(!saved.disputed);
             assert_eq!(store.get_grade(saved.id).unwrap(), saved);
-            assert_eq!(store.list_grades_for_question(question_id).unwrap().len(), 1);
-            assert_eq!(store.list_grades_for_question(question_id + 999).unwrap().len(), 0);
+            assert_eq!(
+                store.list_grades_for_question(question_id).unwrap().len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .list_grades_for_question(question_id + 999)
+                    .unwrap()
+                    .len(),
+                0
+            );
             assert_eq!(store.list_disputes_for_grade(saved.id).unwrap().len(), 0);
             // Recording a dispute flips the grade without touching the award.
             let audit = store.record_dispute(&sample_dispute(saved.id)).unwrap();
@@ -3960,7 +4114,11 @@ mod tests {
             let mut bad_text = sample_dispute(saved.id);
             bad_text.text = " ".to_string();
             assert!(store.record_dispute(&bad_text).is_err());
-            assert!(store.record_dispute(&sample_dispute(saved.id + 999)).is_err());
+            assert!(
+                store
+                    .record_dispute(&sample_dispute(saved.id + 999))
+                    .is_err()
+            );
             assert!(store.get_grade(saved.id + 999).is_err());
         }
     }
@@ -4010,13 +4168,9 @@ mod tests {
     /// preserving existing rows.
     #[test]
     fn migrates_v3_to_v4_preserving_rows() {
-        let dir: std::path::PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "migration-v3-test",
-        ]
-        .iter()
-        .collect();
+        let dir: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "migration-v3-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("cadence.db");
@@ -4046,7 +4200,9 @@ mod tests {
         let mut store = SqliteStore::open(&db_path, &lock_path).unwrap();
         let version: i64 = store
             .conn
-            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // v3 rows survive; v4 tables accept writes with the dispute trail.
@@ -4066,13 +4222,9 @@ mod tests {
     /// assert the v4 → v5 step adds notes while preserving existing rows.
     #[test]
     fn migrates_v4_to_v5_preserving_rows() {
-        let dir: std::path::PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "migration-v4-test",
-        ]
-        .iter()
-        .collect();
+        let dir: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "migration-v4-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("cadence.db");
@@ -4105,7 +4257,9 @@ mod tests {
         let mut store = SqliteStore::open(&db_path, &lock_path).unwrap();
         let version: i64 = store
             .conn
-            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // v4 rows survive; v5 notes accept writes and persist across reopen.
@@ -4125,13 +4279,9 @@ mod tests {
     /// queryable through the v6 accessors.
     #[test]
     fn repairs_drifted_v5_tables_preserving_rows() {
-        let dir: std::path::PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "migration-v5-test",
-        ]
-        .iter()
-        .collect();
+        let dir: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "migration-v5-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("cadence.db");
@@ -4164,7 +4314,9 @@ mod tests {
         let mut store = SqliteStore::open(&db_path, &lock_path).unwrap();
         let version: i64 = store
             .conn
-            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT schema_version FROM version WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // The exact live failure now reads through the v6 accessors.
@@ -4181,7 +4333,14 @@ mod tests {
         assert_eq!(questions[0].kind, "written");
         // Writes use the repaired columns immediately.
         let fresh = store
-            .create_misconception(1, "deref", "star on non-pointer", "picked compiles", "RETEST", "2026-01-07")
+            .create_misconception(
+                1,
+                "deref",
+                "star on non-pointer",
+                "picked compiles",
+                "RETEST",
+                "2026-01-07",
+            )
             .unwrap();
         assert_eq!(fresh.concept_description, "deref");
         assert_eq!(fresh.updated_at, "2026-01-07");

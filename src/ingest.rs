@@ -61,13 +61,10 @@ pub fn file_hash(bytes: &[u8]) -> String {
 /// Default book title: the PDF file stem, falling back to the full file name.
 #[must_use]
 pub fn default_title(pdf_path: &Path) -> String {
-    pdf_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map_or_else(
-            || pdf_path.to_string_lossy().into_owned(),
-            ToString::to_string,
-        )
+    pdf_path.file_stem().and_then(|s| s.to_str()).map_or_else(
+        || pdf_path.to_string_lossy().into_owned(),
+        ToString::to_string,
+    )
 }
 
 /// Heading for a manual range: the shallowest outline entry inside the range
@@ -160,7 +157,8 @@ pub fn plan_book(
 ) -> Result<Vec<PlannedUnit>> {
     if chapter_level.is_some() && manual.is_some() {
         return Err(Error::InvalidInput(
-            "--manual-boundaries needs automatic chapter detection; drop --chapter-level to use it".to_string(),
+            "--manual-boundaries needs automatic chapter detection; drop --chapter-level to use it"
+                .to_string(),
         ));
     }
     let planned = if chapter_level.is_some() {
@@ -243,8 +241,7 @@ pub fn store_units(
             text: unit.text.text.clone(),
             source_pdf_hash: source_hash.to_string(),
         };
-        let json = serde_json::to_string_pretty(&payload)
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&payload).map_err(|e| Error::Io(e.to_string()))?;
         std::fs::write(&path, json)?;
         paths.push(path);
     }
@@ -281,23 +278,12 @@ pub fn load_unit_text(path: &Path) -> Result<UnitText> {
 /// Returns [`Error::Store`] on persistence failures.
 pub fn register_book(
     store: &mut impl Store,
-    title: &str,
-    pdf_path: &Path,
-    source_hash: &str,
-    start_page: i64,
+    book: &NewBook,
     units: &[ReadyUnit],
     chapter_files: &[PathBuf],
     created_at: &str,
 ) -> Result<crate::domain::Book> {
-    let book = store.create_book(
-        &NewBook {
-            title: title.to_string(),
-            filepath: pdf_path.to_string_lossy().into_owned(),
-            file_hash: source_hash.to_string(),
-            start_page,
-        },
-        created_at,
-    )?;
+    let book = store.create_book(book, created_at)?;
     for (index, unit) in units.iter().enumerate() {
         let Ok(index_in_book) = i64::try_from(index) else {
             continue;
@@ -420,10 +406,12 @@ mod tests {
         ];
         let book = register_book(
             &mut store,
-            "Modern C",
-            Path::new("/books/m.pdf"),
-            "hash1",
-            20,
+            &NewBook {
+                title: "Modern C".to_string(),
+                filepath: "/books/m.pdf".to_string(),
+                file_hash: "hash1".to_string(),
+                start_page: 20,
+            },
             &units,
             &[],
             "2026-01-01",
@@ -438,13 +426,9 @@ mod tests {
 
     #[test]
     fn stores_unit_files_under_hash_dir() {
-        let base: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "ingest-store-test",
-        ]
-        .iter()
-        .collect();
+        let base: PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "ingest-store-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&base);
         let units = vec![ReadyUnit {
             heading: "Ch 1".to_string(),
@@ -469,13 +453,9 @@ mod tests {
 
     #[test]
     fn loads_stored_unit_text_for_generation() {
-        let base: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            ".scratch",
-            "ingest-load-test",
-        ]
-        .iter()
-        .collect();
+        let base: PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "ingest-load-test"]
+            .iter()
+            .collect();
         let _ = std::fs::remove_dir_all(&base);
         let units = vec![ReadyUnit {
             heading: "Ch 1".to_string(),

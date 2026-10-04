@@ -125,11 +125,7 @@ pub fn build_notes_prompt(
             let _ = writeln!(
                 prompt,
                 "- [{} {}/{}] {} — {}",
-                grade.classification,
-                grade.score,
-                grade.max_score,
-                grade.question,
-                grade.feedback
+                grade.classification, grade.score, grade.max_score, grade.question, grade.feedback
             );
         }
         prompt.push_str("Cover everything else at natural weight: topics handled well get a confident line or two, not whole sections.");
@@ -289,9 +285,9 @@ pub fn to_new_note(
 pub fn parse_misconceptions_file(text: &str) -> Result<Vec<MisconceptionItem>> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| Error::InvalidInput(format!("misconceptions file is not valid JSON: {e}")))?;
-    let raw = value
-        .as_array()
-        .ok_or_else(|| Error::InvalidInput("misconceptions file must be a JSON array".to_string()))?;
+    let raw = value.as_array().ok_or_else(|| {
+        Error::InvalidInput("misconceptions file must be a JSON array".to_string())
+    })?;
     let mut out = Vec::with_capacity(raw.len());
     for (index, entry) in raw.iter().enumerate() {
         let concept = entry
@@ -327,7 +323,8 @@ mod tests {
 
     fn unit() -> UnitText {
         UnitText {
-            text: "Pointers hold addresses. The & operator takes an address. Dereference with *.".to_string(),
+            text: "Pointers hold addresses. The & operator takes an address. Dereference with *."
+                .to_string(),
             page_start: 10,
             page_end: 20,
             heading: "Pointers".to_string(),
@@ -401,12 +398,8 @@ mod tests {
 
     #[test]
     fn schema_is_closed_shape() {
-        let schema: serde_json::Value =
-            serde_json::from_str(&notes_response_schema()).unwrap();
-        assert_eq!(
-            schema["required"],
-            serde_json::json!(["notes_markdown"])
-        );
+        let schema: serde_json::Value = serde_json::from_str(&notes_response_schema()).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["notes_markdown"]));
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 
@@ -421,7 +414,11 @@ mod tests {
     #[test]
     fn valid_notes_pass() {
         let validated = validate_notes(&good_response()).unwrap();
-        assert!(validated.markdown.contains("## Null checks without comparison"));
+        assert!(
+            validated
+                .markdown
+                .contains("## Null checks without comparison")
+        );
         assert!(validated.markdown.chars().count() >= MIN_NOTES_CHARS);
     }
 
@@ -439,7 +436,9 @@ mod tests {
         // A grading-report-shaped draft: banned phrases, a question
         // reference, and a score — padded past the length floor so the
         // failure is the voice, not the size.
-        let mut doc = String::from("# Chapter notes\n\n## Truth values\nGenuine chapter content about truth values with enough substance to stand alone. ");
+        let mut doc = String::from(
+            "# Chapter notes\n\n## Truth values\nGenuine chapter content about truth values with enough substance to stand alone. ",
+        );
         doc.push_str("\n\n## Misconceptions\nYour assignment Q1 (q1) showed a misconception worth 5/10. Takeaway 3.3 covers it. ");
         doc.push_str("\n\n## Things Demonstrated\nYou answered well; the model solution agrees. ");
         doc.push_str(&"Padding to clear the stub floor. ".repeat(20));
@@ -468,7 +467,8 @@ mod tests {
         assert!(validate_notes("not json").is_err());
         assert!(validate_notes(r#"{"other": 1}"#).is_err());
         assert!(validate_notes(r#"{"notes_markdown": "  "}"#).is_err());
-        let short = serde_json::json!({"notes_markdown": "## Core Mental Models\ntiny"}).to_string();
+        let short =
+            serde_json::json!({"notes_markdown": "## Core Mental Models\ntiny"}).to_string();
         let err = validate_notes(&short).unwrap_err();
         assert!(err.to_string().contains("stub"));
     }

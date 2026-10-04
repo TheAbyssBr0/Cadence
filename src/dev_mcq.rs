@@ -7,11 +7,11 @@
 //! find-or-create (so `--persist --seed S` resumes), and misconception text.
 
 use crate::domain::Chapter;
+use crate::domain::ChapterStatus;
 use crate::engines::UnitText;
 use crate::error::{Error, Result};
-use crate::mcq::{McqPhase, ValidatedMcq, DISPLAYED_OPTION_COUNT, IDK_LABEL};
+use crate::mcq::{DISPLAYED_OPTION_COUNT, IDK_LABEL, McqPhase, ValidatedMcq};
 use crate::store::{NewBook, NewChapter, NewMcqItem, Store};
-use crate::domain::ChapterStatus;
 
 /// Questions generated per `dev mcq` run (§7.1 minimum of the 8–12 range).
 pub const DEV_MCQ_COUNT: usize = 8;
@@ -27,8 +27,7 @@ pub const DEV_ATTEMPT_NO: i64 = 1;
 #[must_use]
 pub fn parse_answer(input: &str) -> Option<usize> {
     let normalized = input.trim().to_lowercase();
-    (0..DISPLAYED_OPTION_COUNT)
-        .find(|index| option_label(*index).eq_ignore_ascii_case(&normalized))
+    (0..DISPLAYED_OPTION_COUNT).find(|index| option_label(*index).eq_ignore_ascii_case(&normalized))
 }
 
 /// Per-question shuffle seed: the session base (from `--seed` or the clock)
@@ -110,26 +109,36 @@ pub fn to_new_items_for(
     Ok(out)
 }
 
+/// Borrowed view of one stored MCQ row for [`validated_from_row`]: the seven
+/// display fields travel together, so they take one parameter, not seven.
+pub struct McqRowView<'a> {
+    /// Question stem.
+    pub question: &'a str,
+    /// JSON array of pre-shuffle option strings.
+    pub options_json: &'a str,
+    /// Correct-option index pre-shuffle.
+    pub correct_index: i64,
+    /// Trap-option index pre-shuffle.
+    pub trap_index: i64,
+    /// 2–5 sentence explanation.
+    pub explanation: &'a str,
+    /// Topic label.
+    pub topic: &'a str,
+    /// JSON source references (`pages`, `sections`).
+    pub source_refs: &'a str,
+}
+
 /// Rebuild a validated item from its stored row so the display shuffle can be
 /// recomputed deterministically on resume.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Store`] when the row's JSON or indices are corrupt.
-pub fn validated_from_row(
-    question: &str,
-    options_json: &str,
-    correct_index: i64,
-    trap_index: i64,
-    explanation: &str,
-    topic: &str,
-    source_refs: &str,
-    unit: &UnitText,
-) -> Result<ValidatedMcq> {
+pub fn validated_from_row(row: &McqRowView<'_>, unit: &UnitText) -> Result<ValidatedMcq> {
     let options: Vec<String> =
-        serde_json::from_str(options_json).map_err(|e| Error::Store(e.to_string()))?;
+        serde_json::from_str(row.options_json).map_err(|e| Error::Store(e.to_string()))?;
     let refs: serde_json::Value =
-        serde_json::from_str(source_refs).map_err(|e| Error::Store(e.to_string()))?;
+        serde_json::from_str(row.source_refs).map_err(|e| Error::Store(e.to_string()))?;
     let pages: Vec<i64> = refs
         .get("pages")
         .and_then(serde_json::Value::as_array)
@@ -145,18 +154,18 @@ pub fn validated_from_row(
                 .collect()
         });
     let (Some(correct), Some(trap)) = (
-        usize::try_from(correct_index).ok(),
-        usize::try_from(trap_index).ok(),
+        usize::try_from(row.correct_index).ok(),
+        usize::try_from(row.trap_index).ok(),
     ) else {
         return Err(Error::Store("stored MCQ index out of range".to_string()));
     };
     let item = ValidatedMcq {
-        question: question.to_string(),
+        question: row.question.to_string(),
         options,
         correct_index: correct,
         trap_index: trap,
-        explanation: explanation.to_string(),
-        topic: topic.to_string(),
+        explanation: row.explanation.to_string(),
+        topic: row.topic.to_string(),
         source_refs: crate::mcq::SourceRefs { pages, sections },
     };
     // Reuse the shape gate (minus count): a corrupt row fails loudly rather
@@ -178,29 +187,28 @@ pub fn ensure_dev_chapter(
     pdf_name: &str,
     unit: &UnitText,
 ) -> Result<Chapter> {
-    if let Ok(book) = store.get_book(1) {
-        if book.file_hash == pdf_hash {
-            let chapters = store.list_chapters(book.id)?;
-            for chapter in &chapters {
-                if chapter.start_page == unit.page_start && chapter.end_page == unit.page_end
-                {
-                    return Ok(chapter.clone());
-                }
+    if let Ok(book) = store.get_book(1)
+        && book.file_hash == pdf_hash
+    {
+        let chapters = store.list_chapters(book.id)?;
+        for chapter in &chapters {
+            if chapter.start_page == unit.page_start && chapter.end_page == unit.page_end {
+                return Ok(chapter.clone());
             }
-            if let Some(first) = chapters.first() {
-                return Ok(first.clone());
-            }
-            return store.create_chapter(&NewChapter {
-                book_id: book.id,
-                index_in_book: i64::try_from(chapters.len()).unwrap_or(0),
-                level: 1,
-                title: unit.heading.clone(),
-                start_page: unit.page_start,
-                end_page: unit.page_end,
-                file_path: format!("dev:{pdf_name}"),
-                status: ChapterStatus::PretestReady,
-            });
         }
+        if let Some(first) = chapters.first() {
+            return Ok(first.clone());
+        }
+        return store.create_chapter(&NewChapter {
+            book_id: book.id,
+            index_in_book: i64::try_from(chapters.len()).unwrap_or(0),
+            level: 1,
+            title: unit.heading.clone(),
+            start_page: unit.page_start,
+            end_page: unit.page_end,
+            file_path: format!("dev:{pdf_name}"),
+            status: ChapterStatus::PretestReady,
+        });
     }
     let book = store.create_book(
         &NewBook {
@@ -242,9 +250,8 @@ pub fn misconception_texts(
     } else {
         "non-trap wrong answer"
     };
-    let evidence = format!(
-        "Selected '{selected_text}' ({kind}) instead of '{correct_text}' for: {question}"
-    );
+    let evidence =
+        format!("Selected '{selected_text}' ({kind}) instead of '{correct_text}' for: {question}");
     (concept, description, evidence)
 }
 
@@ -331,13 +338,15 @@ mod tests {
         assert_eq!(rows[0].phase, "pretest");
         assert_eq!(rows[0].attempt_no, DEV_ATTEMPT_NO);
         let back = validated_from_row(
-            &rows[0].question_text,
-            &rows[0].options_json,
-            rows[0].correct_index,
-            rows[0].trap_index,
-            &rows[0].explanation_text,
-            &rows[0].topic,
-            &rows[0].source_refs,
+            &McqRowView {
+                question: &rows[0].question_text,
+                options_json: &rows[0].options_json,
+                correct_index: rows[0].correct_index,
+                trap_index: rows[0].trap_index,
+                explanation: &rows[0].explanation_text,
+                topic: &rows[0].topic,
+                source_refs: &rows[0].source_refs,
+            },
             &unit(),
         )
         .unwrap();
@@ -372,13 +381,15 @@ mod tests {
     #[test]
     fn corrupt_row_fails_loudly() {
         let err = validated_from_row(
-            "q",
-            "not-json",
-            0,
-            1,
-            "explanation with enough length here",
-            "t",
-            "{}",
+            &McqRowView {
+                question: "q",
+                options_json: "not-json",
+                correct_index: 0,
+                trap_index: 1,
+                explanation: "explanation with enough length here",
+                topic: "t",
+                source_refs: "{}",
+            },
             &unit(),
         )
         .unwrap_err();

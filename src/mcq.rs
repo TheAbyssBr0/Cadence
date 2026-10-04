@@ -65,9 +65,7 @@ impl McqPhase {
             "pretest" => Ok(Self::Pretest),
             "retest" => Ok(Self::Retest),
             "review" => Ok(Self::Review),
-            other => Err(Error::InvalidInput(format!(
-                "unknown MCQ phase: {other}"
-            ))),
+            other => Err(Error::InvalidInput(format!("unknown MCQ phase: {other}"))),
         }
     }
 
@@ -325,8 +323,16 @@ fn is_idk_smuggle(text: &str) -> bool {
 /// and options. Includes book-specific box labels (`takeaway`, `challenge`:
 /// only the numbered-pointer use matches, plain prose never does).
 const DEICTIC_KEYWORDS: [&str; 10] = [
-    "listing", "figure", "table", "section", "exercise", "example", "page", "line",
-    "takeaway", "challenge",
+    "listing",
+    "figure",
+    "table",
+    "section",
+    "exercise",
+    "example",
+    "page",
+    "line",
+    "takeaway",
+    "challenge",
 ];
 
 /// Discourse phrases pointing at book content rather than inlining it.
@@ -389,8 +395,7 @@ fn keyword_with_number(lower: &str, keyword: &str) -> bool {
             continue;
         }
         if chars
-            .skip_while(|c| c.is_whitespace())
-            .next()
+            .find(|c| !c.is_whitespace())
             .is_some_and(|c| c.is_ascii_digit())
         {
             return true;
@@ -455,10 +460,7 @@ pub fn deictic_violation(text: &str) -> Option<String> {
 }
 
 /// Validate the 4 generated options (non-empty, no `IDK` smuggle, distinct).
-fn validate_options(
-    options_value: &[serde_json::Value],
-    ctx: &str,
-) -> Result<Vec<String>> {
+fn validate_options(options_value: &[serde_json::Value], ctx: &str) -> Result<Vec<String>> {
     if options_value.len() != MCQ_OPTION_COUNT {
         return Err(Error::LlmFatal(format!(
             "{ctx}: 'options' must have exactly {MCQ_OPTION_COUNT} entries"
@@ -527,11 +529,7 @@ fn validate_indices(value: &serde_json::Value, ctx: &str) -> Result<(usize, usiz
 }
 
 /// Validate `source_refs` (pages inside the unit range, sections named).
-fn validate_refs(
-    value: &serde_json::Value,
-    ctx: &str,
-    unit: &UnitText,
-) -> Result<SourceRefs> {
+fn validate_refs(value: &serde_json::Value, ctx: &str, unit: &UnitText) -> Result<SourceRefs> {
     let refs = value.get("source_refs").ok_or_else(|| {
         Error::LlmFatal(format!("{ctx}: missing 'source_refs' (pages + sections)"))
     })?;
@@ -574,9 +572,7 @@ fn validate_refs(
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::LlmFatal(format!("{ctx}: source sections must be non-empty"))
-            })?;
+            .ok_or_else(|| Error::LlmFatal(format!("{ctx}: source sections must be non-empty")))?;
         sections.push(name.to_string());
     }
     Ok(SourceRefs { pages, sections })
@@ -611,9 +607,7 @@ fn validate_one(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| s.len() >= 20)
-        .ok_or_else(|| {
-            Error::LlmFatal(format!("{ctx}: missing 'explanation' (2-5 sentences)"))
-        })?;
+        .ok_or_else(|| Error::LlmFatal(format!("{ctx}: missing 'explanation' (2-5 sentences)")))?;
     let topic = value
         .get("topic")
         .and_then(serde_json::Value::as_str)
@@ -646,8 +640,8 @@ pub fn validate_mcq_set_ranged(
     min: usize,
     max: usize,
 ) -> Result<Vec<ValidatedMcq>> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| Error::LlmFatal(format!("invalid MCQ JSON: {e}")))?;
+    let parsed: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| Error::LlmFatal(format!("invalid MCQ JSON: {e}")))?;
     let questions = parsed
         .get("questions")
         .and_then(serde_json::Value::as_array)
@@ -764,7 +758,6 @@ pub fn check_review_topics(items: &[ValidatedMcq], concepts: &[ReviewConcept]) -
 }
 
 /// `SplitMix64` step: cheap deterministic PRNG for seeded shuffles.
-#[allow(clippy::doc_markdown)]
 pub const fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -776,18 +769,22 @@ pub const fn splitmix64(state: &mut u64) -> u64 {
 /// Deterministic Fisher-Yates permutation of `[0,1,2,3]` from `seed`.
 /// Pure: the same seed always yields the same order; the LLM never controls
 /// presentation order.
-#[allow(clippy::many_single_char_names)]
 #[must_use]
 pub fn shuffle_order(seed: u64) -> [usize; MCQ_OPTION_COUNT] {
-    let mut order = vec![0_usize, 1, 2, 3];
+    let mut order = [0_usize, 1, 2, 3];
     let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15 | 1);
     let mut cursor = order.len();
     while cursor > 1 {
         cursor = cursor.saturating_sub(1);
         let bound = cursor.saturating_add(1);
         let divisor = u64::try_from(bound).unwrap_or(1).max(1);
-        let rand = splitmix64(&mut state).checked_rem(divisor).unwrap_or_default();
-        let slot = usize::try_from(rand).unwrap_or_default().checked_rem(bound).unwrap_or_default();
+        let rand = splitmix64(&mut state)
+            .checked_rem(divisor)
+            .unwrap_or_default();
+        let slot = usize::try_from(rand)
+            .unwrap_or_default()
+            .checked_rem(bound)
+            .unwrap_or_default();
         order.swap(cursor, slot);
     }
     let first = order.first().copied().unwrap_or_default();
@@ -801,14 +798,13 @@ pub fn shuffle_order(seed: u64) -> [usize; MCQ_OPTION_COUNT] {
 #[must_use]
 pub fn random_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(
-        0x1234_5678_9ABC_DEF0,
-        |d| {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0x1234_5678_9ABC_DEF0, |d| {
             u64::from(d.subsec_nanos())
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 .wrapping_add(d.as_secs())
-        },
-    )
+        })
 }
 
 /// Apply a seeded shuffle to a validated item: remaps correct/trap into
@@ -876,7 +872,8 @@ mod tests {
 
     fn unit() -> UnitText {
         UnitText {
-            text: "Pointers hold addresses. The & operator takes an address. Dereference with *.".to_string(),
+            text: "Pointers hold addresses. The & operator takes an address. Dereference with *."
+                .to_string(),
             page_start: 10,
             page_end: 20,
             heading: "Pointers".to_string(),
@@ -896,8 +893,7 @@ mod tests {
     }
 
     fn set_with(item: &serde_json::Value, count: usize) -> String {
-        let items: Vec<serde_json::Value> =
-            (0..count).map(|_| item.clone()).collect();
+        let items: Vec<serde_json::Value> = (0..count).map(|_| item.clone()).collect();
         serde_json::json!({"questions": items}).to_string()
     }
 
@@ -914,7 +910,10 @@ mod tests {
     #[test]
     fn task_types_map_to_mcq_phases() {
         use crate::domain::TaskType;
-        assert_eq!(McqPhase::for_task(TaskType::Pretest), Some(McqPhase::Pretest));
+        assert_eq!(
+            McqPhase::for_task(TaskType::Pretest),
+            Some(McqPhase::Pretest)
+        );
         assert_eq!(McqPhase::for_task(TaskType::Retest), Some(McqPhase::Retest));
         assert_eq!(McqPhase::for_task(TaskType::Read), None);
         assert_eq!(McqPhase::for_task(TaskType::AssignmentWrite), None);
@@ -974,10 +973,7 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(&mcq_review_response_schema()).unwrap();
         assert_eq!(schema["properties"]["questions"]["minItems"], 1);
-        assert_eq!(
-            schema["properties"]["questions"]["maxItems"],
-            MAX_QUESTIONS
-        );
+        assert_eq!(schema["properties"]["questions"]["maxItems"], MAX_QUESTIONS);
         // The standard schema keeps the §7.1 floor: the two must differ.
         assert_ne!(mcq_review_response_schema(), mcq_response_schema());
     }
@@ -1023,7 +1019,8 @@ mod tests {
     }
 
     #[test]
-    fn detector_catches_book_pointers() {        let stem = "In the bad.c program from Listing 1.2, why does clang treat the diagnostic on line 22 as fatal?";
+    fn detector_catches_book_pointers() {
+        let stem = "In the bad.c program from Listing 1.2, why does clang treat the diagnostic on line 22 as fatal?";
         let reason = deictic_violation(stem).unwrap();
         assert!(reason.contains("listing"), "{reason}");
         assert!(deictic_violation("What happens on line 22?").is_some());
@@ -1032,7 +1029,12 @@ mod tests {
         assert!(deictic_violation("Unlike the example above, what does this do?").is_some());
         assert!(deictic_violation("Which Section 4 rule applies here?").is_some());
         // Book-specific box labels used as pointers.
-        assert!(deictic_violation("According to TAKEAWAY 2.5, what relates declarations to definitions?").is_some());
+        assert!(
+            deictic_violation(
+                "According to TAKEAWAY 2.5, what relates declarations to definitions?"
+            )
+            .is_some()
+        );
         assert!(deictic_violation("Solve Challenge 3 with pointers.").is_some());
     }
 
@@ -1040,14 +1042,23 @@ mod tests {
     fn detector_allows_standalone_text() {
         assert_eq!(deictic_violation("What does &x yield?"), None);
         // Bare above/below in domain content is legal.
-        assert_eq!(deictic_violation("Which values count as true: above zero or below?"), None);
+        assert_eq!(
+            deictic_violation("Which values count as true: above zero or below?"),
+            None
+        );
         // Substrings of longer words never match.
         assert_eq!(deictic_violation("When is a function inlined?"), None);
         assert_eq!(deictic_violation("Name the pipeline stages."), None);
         assert_eq!(deictic_violation("The outline covers pointers."), None);
         // Box labels as plain concepts (no number) stay legal.
-        assert_eq!(deictic_violation("What does the as-if rule guarantee?"), None);
-        assert_eq!(deictic_violation("What is the challenge with dangling pointers?"), None);
+        assert_eq!(
+            deictic_violation("What does the as-if rule guarantee?"),
+            None
+        );
+        assert_eq!(
+            deictic_violation("What is the challenge with dangling pointers?"),
+            None
+        );
     }
 
     #[test]
@@ -1090,17 +1101,31 @@ mod tests {
 
     #[test]
     fn response_schema_mirrors_validator_shape() {
-        let schema: serde_json::Value =
-            serde_json::from_str(&mcq_response_schema()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&mcq_response_schema()).unwrap();
         let questions = &schema["properties"]["questions"];
         assert_eq!(questions["minItems"], serde_json::json!(MIN_QUESTIONS));
         assert_eq!(questions["maxItems"], serde_json::json!(MAX_QUESTIONS));
         let item = &questions["items"];
-        assert_eq!(item["properties"]["options"]["minItems"], serde_json::json!(4));
-        assert_eq!(item["properties"]["options"]["maxItems"], serde_json::json!(4));
-        assert_eq!(item["properties"]["correct_index"]["maximum"], serde_json::json!(3));
-        assert_eq!(item["properties"]["trap_index"]["maximum"], serde_json::json!(3));
-        assert_eq!(item["properties"]["source_refs"]["properties"]["pages"]["minItems"], serde_json::json!(1));
+        assert_eq!(
+            item["properties"]["options"]["minItems"],
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            item["properties"]["options"]["maxItems"],
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            item["properties"]["correct_index"]["maximum"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            item["properties"]["trap_index"]["maximum"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            item["properties"]["source_refs"]["properties"]["pages"]["minItems"],
+            serde_json::json!(1)
+        );
         assert_eq!(item["required"].as_array().unwrap().len(), 7);
         // The params tag tracks this exact schema text.
         let tag = crate::llm::schema_tag(&mcq_response_schema());
@@ -1208,7 +1233,11 @@ mod tests {
     #[test]
     fn misconception_rule_only_retest_non_idk() {
         assert!(should_log_misconception(McqPhase::Retest, false, 0));
-        assert!(!should_log_misconception(McqPhase::Retest, false, IDK_INDEX));
+        assert!(!should_log_misconception(
+            McqPhase::Retest,
+            false,
+            IDK_INDEX
+        ));
         assert!(!should_log_misconception(McqPhase::Retest, true, 0));
         assert!(!should_log_misconception(McqPhase::Pretest, false, 0));
     }

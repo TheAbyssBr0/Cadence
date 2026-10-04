@@ -47,15 +47,10 @@ impl MuPdfSource {
                 path.display()
             )));
         }
-        let count_i32 = doc
-            .page_count()
-            .map_err(|e| Error::Pdf(e.to_string()))?;
+        let count_i32 = doc.page_count().map_err(|e| Error::Pdf(e.to_string()))?;
         let pages = i64::from(count_i32);
         if pages < 1 {
-            return Err(Error::Pdf(format!(
-                "PDF has no pages: {}",
-                path.display()
-            )));
+            return Err(Error::Pdf(format!("PDF has no pages: {}", path.display())));
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -90,8 +85,7 @@ fn open_document(path: &Path) -> Result<Document> {
 /// Returns [`Error::Pdf`] on overflow (practically unreachable; `u32 -> i64`
 /// always fits, but the `+1` is still checked).
 pub fn zero_based_to_one_based(zero_based: u32) -> Result<i64> {
-    let base = i64::try_from(zero_based)
-        .map_err(|e| Error::Pdf(format!("page number overflow: {e}")))?;
+    let base = i64::from(zero_based);
     base.checked_add(1)
         .ok_or_else(|| Error::Pdf("page number overflow".to_string()))
 }
@@ -118,7 +112,10 @@ fn resolve_entry(doc: &Document, entry: &mupdf::Outline) -> Option<u32> {
         return Some(dest.loc.page_number);
     }
     let uri = entry.uri.as_deref()?;
-    doc.resolve_link(uri).ok().flatten().map(|d| d.loc.page_number)
+    doc.resolve_link(uri)
+        .ok()
+        .flatten()
+        .map(|d| d.loc.page_number)
 }
 
 /// Depth-first flatten of the outline tree into `(title, one_based_page,
@@ -132,10 +129,10 @@ fn flatten(
 ) {
     for entry in entries {
         let child_depth = depth.saturating_add(1);
-        if let Some(zero_based) = resolve_entry(doc, entry) {
-            if let Ok(one_based) = zero_based_to_one_based(zero_based) {
-                out.push((entry.title.clone(), one_based, depth));
-            }
+        if let Some(zero_based) = resolve_entry(doc, entry)
+            && let Ok(one_based) = zero_based_to_one_based(zero_based)
+        {
+            out.push((entry.title.clone(), one_based, depth));
         }
         flatten(doc, &entry.down, child_depth, out);
     }
@@ -189,9 +186,8 @@ impl PdfSource for MuPdfSource {
             let zero_based = page
                 .checked_sub(1)
                 .ok_or_else(|| Error::InvalidInput("page underflow".to_string()))?;
-            let index = i32::try_from(zero_based).map_err(|e| {
-                Error::InvalidInput(format!("page index overflow: {e}"))
-            })?;
+            let index = i32::try_from(zero_based)
+                .map_err(|e| Error::InvalidInput(format!("page index overflow: {e}")))?;
             let loaded = doc
                 .load_page(index)
                 .map_err(|e| Error::Pdf(e.to_string()))?;
@@ -200,9 +196,9 @@ impl PdfSource for MuPdfSource {
                 .map_err(|e| Error::Pdf(e.to_string()))?;
             let clean = sanitize_text(&raw);
             if combined.is_empty() {
-                let _ = write!(combined, "--- physical page {page} ---\n");
+                let _ = writeln!(combined, "--- physical page {page} ---");
             } else {
-                let _ = write!(combined, "\n\n--- physical page {page} ---\n");
+                let _ = writeln!(combined, "\n\n--- physical page {page} ---");
             }
             combined.push_str(&clean);
             let Some(next) = page.checked_add(1) else {
@@ -229,6 +225,17 @@ mod tests {
         p.pop();
         p.push("Modern C.pdf");
         p
+    }
+
+    /// Open the fixture PDF, or `None` when it is absent (the 4.2 MB book is
+    /// deliberately untracked, so environments without it — e.g. CI — skip
+    /// these tests instead of failing). Present-but-unreadable still fails.
+    fn fixture_source() -> Option<MuPdfSource> {
+        let path = fixture_pdf();
+        if !path.is_file() {
+            return None;
+        }
+        Some(MuPdfSource::open(&path).unwrap())
     }
 
     #[test]
@@ -260,10 +267,12 @@ mod tests {
 
     #[test]
     fn outline_filters_front_matter() {
-        let source = MuPdfSource::open(&fixture_pdf()).unwrap();
+        let Some(source) = fixture_source() else {
+            return;
+        };
         assert_eq!(source.page_count(), 408);
         let all = source.outline(1).unwrap();
-        assert!(all.first().is_some());
+        assert_ne!(all.len(), 0);
         let from_18 = source.outline(18).unwrap();
         assert!(from_18.iter().all(|b| b.page >= 18));
         assert!(from_18.len() < all.len());
@@ -276,7 +285,9 @@ mod tests {
 
     #[test]
     fn outline_pages_within_document() {
-        let source = MuPdfSource::open(&fixture_pdf()).unwrap();
+        let Some(source) = fixture_source() else {
+            return;
+        };
         for entry in source.outline(18).unwrap() {
             assert!(entry.page >= 18);
             assert!(entry.page <= 408);
@@ -287,7 +298,9 @@ mod tests {
 
     #[test]
     fn text_range_carries_provenance_and_content() {
-        let source = MuPdfSource::open(&fixture_pdf()).unwrap();
+        let Some(source) = fixture_source() else {
+            return;
+        };
         let unit = source.text_for_range(25, 25).unwrap();
         assert_eq!(unit.page_start, 25);
         assert_eq!(unit.page_end, 25);
@@ -298,7 +311,9 @@ mod tests {
 
     #[test]
     fn text_range_rejects_bad_ranges() {
-        let source = MuPdfSource::open(&fixture_pdf()).unwrap();
+        let Some(source) = fixture_source() else {
+            return;
+        };
         assert!(source.text_for_range(0, 5).is_err());
         assert!(source.text_for_range(10, 5).is_err());
         assert!(source.text_for_range(400, 409).is_err());

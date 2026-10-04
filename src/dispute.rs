@@ -177,21 +177,21 @@ pub fn build_dispute_prompt(
 ///
 /// Returns [`Error::LlmFatal`] describing the defect (fed back into the
 /// fast-retry repair loop by `complete_cached`).
-pub fn validate_dispute(
-    text: &str,
-    max_score: i64,
-    original_score: i64,
-) -> Result<DisputeResult> {
+pub fn validate_dispute(text: &str, max_score: i64, original_score: i64) -> Result<DisputeResult> {
     let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| Error::LlmFatal(format!("dispute audit is not valid JSON: {e}")))?;
     let dispute_valid = parsed
         .get("dispute_valid")
         .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| Error::LlmFatal("dispute audit missing boolean 'dispute_valid'".to_string()))?;
+        .ok_or_else(|| {
+            Error::LlmFatal("dispute audit missing boolean 'dispute_valid'".to_string())
+        })?;
     let final_score = parsed
         .get("final_score")
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| Error::LlmFatal("dispute audit missing integer 'final_score'".to_string()))?;
+        .ok_or_else(|| {
+            Error::LlmFatal("dispute audit missing integer 'final_score'".to_string())
+        })?;
     if final_score < 0 || final_score > max_score {
         return Err(Error::LlmFatal(format!(
             "dispute final_score {final_score} outside 0-{max_score}"
@@ -332,7 +332,10 @@ mod tests {
 
     #[test]
     fn action_round_trip() {
-        assert_eq!(DisputeAction::parse("REVISED").unwrap(), DisputeAction::Revised);
+        assert_eq!(
+            DisputeAction::parse("REVISED").unwrap(),
+            DisputeAction::Revised
+        );
         assert_eq!(
             DisputeAction::parse("QUESTION_DEFECTIVE").unwrap(),
             DisputeAction::QuestionDefective
@@ -404,7 +407,10 @@ mod tests {
     fn audit_identity_is_stable_and_sensitive() {
         let first = dispute_source_hash("q", "r", "a", "g", "d");
         assert_eq!(first, dispute_source_hash("q", "r", "a", "g", "d"));
-        assert_ne!(first, dispute_source_hash("q", "r", "a", "g", "revised dispute"));
+        assert_ne!(
+            first,
+            dispute_source_hash("q", "r", "a", "g", "revised dispute")
+        );
         assert_ne!(first, dispute_source_hash("q", "r", "revised", "g", "d"));
         assert!(dispute_params_json_for(5).contains("\"operation\":\"dispute\""));
         assert!(dispute_params_json_for(5).contains("\"max_tokens\":4000"));
@@ -414,7 +420,9 @@ mod tests {
     #[test]
     fn purge_predicate_fires_on_successful_disputes_only() {
         assert!(should_purge_misconceptions(DisputeAction::Revised));
-        assert!(should_purge_misconceptions(DisputeAction::QuestionDefective));
+        assert!(should_purge_misconceptions(
+            DisputeAction::QuestionDefective
+        ));
         assert!(!should_purge_misconceptions(DisputeAction::Upheld));
     }
 
@@ -450,7 +458,12 @@ mod tests {
         let rows = vec![
             purge_row(3, "aliasing", "RETEST", "RESOLVED"),
             purge_row(4, "Assignment Q1: Explain &x", "ASSIGNMENT", "DISPUTED"),
-            purge_row(5, "Assignment Q2: Explain lifetimes", "ASSIGNMENT", "ACTIVE"),
+            purge_row(
+                5,
+                "Assignment Q2: Explain lifetimes",
+                "ASSIGNMENT",
+                "ACTIVE",
+            ),
             purge_row(6, "Assignment Q1: Explain &x", "RETEST", "ACTIVE"),
         ];
         // Target 3 is resolved on earlier evidence — untouched by the bad
@@ -473,10 +486,18 @@ mod tests {
     }
     #[test]
     fn audit_schema_bounds_final_score() {
-        let schema: serde_json::Value =
-            serde_json::from_str(&dispute_response_schema(8)).unwrap();
-        assert_eq!(schema["properties"]["final_score"]["maximum"], serde_json::json!(8));
-        assert_eq!(schema["properties"]["action"]["enum"].as_array().unwrap().len(), 3);
+        let schema: serde_json::Value = serde_json::from_str(&dispute_response_schema(8)).unwrap();
+        assert_eq!(
+            schema["properties"]["final_score"]["maximum"],
+            serde_json::json!(8)
+        );
+        assert_eq!(
+            schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
         let tag = crate::llm::schema_tag(&dispute_response_schema(8));
         assert!(dispute_params_json_for(8).contains(&tag));
         assert_ne!(dispute_params_json_for(8), dispute_params_json_for(5));
