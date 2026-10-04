@@ -1,0 +1,4857 @@
+//! `cadence` entrypoint: CLI → Core Engine → Persistence.
+
+mod cli;
+mod config;
+mod assignment;
+mod dev_mcq;
+mod dispute;
+mod domain;
+mod engines;
+mod error;
+mod grading;
+mod ingest;
+mod llm;
+mod mcq;
+mod metrics;
+mod misconceptions;
+mod notes;
+mod pdf;
+mod review;
+mod scheduler;
+mod split;
+mod store;
+
+use std::io::{IsTerminal, Write as _};
+use std::process::Command;
+
+use chrono::NaiveDate;
+use clap::Parser;
+
+use cli::{Cli, Commands, DevStage};
+use config::Config;
+use domain::{Task, TaskStatus, TaskType};
+use engines::PdfSource;
+use error::{Error, Result};
+use scheduler::{
+    classify_task, complete_and_advance, count_skipped, ensure_tasks, execution_rank,
+    format_chapter_start_prompt, overdue_tasks, project_window, pull_available, pull_next,
+    skip_chapter, today_queue, unskip_chapter,
+};
+use store::{MemoryStore, SqliteStore, Store};
+
+/// Verify `nvim` is installed; it is a hard dependency (§7.2).
+///
+/// # Errors
+///
+/// Returns [`Error::MissingDependency`] when `nvim` cannot be executed.
+fn require_nvim() -> Result<()> {
+    Command::new("nvim")
+        .arg("--version")
+        .output()
+        .map_err(|_| {
+            Error::MissingDependency(
+                "nvim is required but was not found on PATH; install neovim to continue".to_string(),
+            )
+        })
+        .map(|_| ())
+}
+
+/// Parse a `YYYY-MM-DD` date.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] on malformed dates.
+fn parse_date(text: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map_err(|e| Error::InvalidInput(format!("bad date '{text}': {e}")))
+}
+
+/// Today's date (injected boundary: only `main` and `dev schedule` read the
+/// clock; engines take dates as parameters).
+fn today_date() -> NaiveDate {
+    chrono::Local::now().date_naive()
+}
+
+/// Open the production store (creates `data_dir` on demand).
+fn open_production_store(config: &Config) -> Result<SqliteStore> {
+    SqliteStore::open(&config.db_path(), &config.lock_path())
+}
+
+/// Top up scheduler state for every registered book (§4–§6): unlocks, opens
+/// stranded reading stages, and creates missing tasks due `today`.
+/// Returns the total number of tasks created.
+fn ensure_all_books(store: &mut SqliteStore, today: NaiveDate, today_str: &str) -> Result<usize> {
+    let books = store.list_books()?;
+    let mut total = 0_usize;
+    for book in &books {
+        total = total.saturating_add(ensure_tasks(store, book.id, today, today_str)?.len());
+    }
+    Ok(total)
+}
+
+/// Ask a yes/no question on an interactive terminal. Returns `None` when
+/// stdin is not a terminal (piped/CI): callers proceed without prompting.
+fn ask_terminal(prompt: &str) -> Result<Option<bool>> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    let bytes = std::io::stdin().read_line(&mut line)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let answer = line.trim().to_lowercase();
+    Ok(Some(answer.is_empty() || answer == "y" || answer == "yes"))
+}
+
+/// Whether a continue-prompt answer chains forward: only an explicit
+/// `y`/`yes` — Enter, `n`, and anything else exits.
+#[must_use]
+fn parse_continue_answer(line: &str) -> bool {
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Ask the daily-loop continue prompt: only an explicit `y`/`yes` chains
+/// into the next task — Enter, `n`, or EOF exits cleanly with state saved,
+/// so the loop never cascades through the pipeline on lazy Enters. Piped
+/// (non-terminal) stdin continues, preserving scripted runs.
+///
+/// # Errors
+///
+/// Propagates [`Error::Io`] on terminal read failures.
+fn ask_continue(prompt: &str) -> Result<bool> {
+    use std::io::Write as _;
+    if !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    let bytes = std::io::stdin().read_line(&mut line)?;
+    if bytes == 0 {
+        return Ok(false);
+    }
+    Ok(parse_continue_answer(&line))
+}
+
+/// Outcome of the pre-chapter gate (§4.1): proceed into the chapter, skip it
+/// outright (explicit `s` only), or leave the loop with state saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChapterGate {
+    Proceed,
+    Skip,
+    Exit,
+}
+
+/// Parse one gate answer: `None` means unrecognized (the caller re-prompts).
+/// Only an explicit `s` skips — `n` never does (§15: anything but `Y`
+/// exits cleanly).
+fn parse_gate_answer(line: &str) -> Option<ChapterGate> {
+    match line.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => Some(ChapterGate::Proceed),
+        "s" | "skip" => Some(ChapterGate::Skip),
+        "n" | "no" | "q" | "quit" | "exit" => Some(ChapterGate::Exit),
+        _ => None,
+    }
+}
+
+/// Ask the pre-chapter gate on an interactive terminal. Non-terminal stdin
+/// (piped/CI) proceeds without prompting; EOF exits with state saved.
+///
+/// # Errors
+///
+/// Propagates [`Error::Io`] on terminal read failures.
+fn ask_chapter_gate(prompt: &str) -> Result<ChapterGate> {
+    use std::io::Write as _;
+    if !std::io::stdin().is_terminal() {
+        return Ok(ChapterGate::Proceed);
+    }
+    loop {
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let bytes = std::io::stdin().read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(ChapterGate::Exit);
+        }
+        if let Some(answer) = parse_gate_answer(&line) {
+            return Ok(answer);
+        }
+        println!("Please answer Y (proceed), s (skip chapter), or n (exit).");
+    }
+}
+
+/// Pre-chapter gate (§4.1): when the daily loop reaches a new chapter, offer
+/// proceed / skip / exit. Skipping deletes pending tasks (completed work
+/// stays as an audit trail); exiting saves state for resume. Returns the
+/// gate outcome for the loop to act on.
+fn gate_chapter_start(
+    store: &mut SqliteStore,
+    chapter: &domain::Chapter,
+    today_str: &str,
+) -> Result<ChapterGate> {
+    let prompt = format_chapter_start_prompt(&chapter.title, chapter.start_page, chapter.end_page);
+    match ask_chapter_gate(&prompt)? {
+        ChapterGate::Skip => {
+            skip_chapter(store, chapter.id, today_str)?;
+            println!("Skipped chapter {} ('{}').", chapter.id, chapter.title);
+            Ok(ChapterGate::Skip)
+        }
+        outcome => Ok(outcome),
+    }
+}
+
+/// List chapters across all books with status, pages, and `~ likely meta`
+/// presentation flags (§4.1). Never auto-skips.
+fn print_skip_listing(store: &SqliteStore) -> Result<()> {
+    let books = store.list_books()?;
+    if books.is_empty() {
+        println!("No books ingested yet.");
+        return Ok(());
+    }
+    for book in &books {
+        println!("Book {} — {}:", book.id, book.title);
+        for chapter in store.list_chapters(book.id)? {
+            let pages = domain::unit_page_count(chapter.start_page, chapter.end_page).unwrap_or(0);
+            let flag = if domain::likely_meta(&chapter.title, chapter.level, pages) {
+                "~ likely meta"
+            } else {
+                ""
+            };
+            println!(
+                "  [{}] {} '{}' (pages {}–{}, attempt {}) {flag}",
+                chapter.status.as_str(),
+                chapter.id,
+                chapter.title,
+                chapter.start_page,
+                chapter.end_page,
+                chapter.attempt_no
+            );
+        }
+    }
+    println!("Usage: cadence skip <id> | cadence unskip <id>");
+    Ok(())
+}
+
+/// `cadence skip [id]`: list without args, skip one chapter with an id.
+fn run_skip(store: &mut SqliteStore, id: Option<i64>, today_str: &str) -> Result<()> {
+    let Some(chapter_id) = id else {
+        return print_skip_listing(store);
+    };
+    let removed = skip_chapter(store, chapter_id, today_str)?;
+    println!("Skipped chapter {chapter_id} ({removed} pending task(s) removed).");
+    Ok(())
+}
+
+/// `cadence unskip <id>`: restart a skipped chapter fresh on a new attempt.
+fn run_unskip(
+    store: &mut SqliteStore,
+    chapter_id: i64,
+    today: NaiveDate,
+    today_str: &str,
+) -> Result<()> {
+    let task = unskip_chapter(store, chapter_id, today, today_str)?;
+    println!(
+        "Unskipped chapter {chapter_id} (fresh pretest scheduled for {}).",
+        task.scheduled_for
+    );
+    Ok(())
+}
+
+/// Reading stage (§4): present the chapter's pages and confirm completion.
+/// A `Y` answer completes the `READ` task via the scheduler (retest lands
+/// tomorrow); anything else leaves state untouched for resume. Returns
+/// whether the task completed.
+fn run_reading_task(store: &mut SqliteStore, task: &Task, today_str: &str) -> Result<bool> {
+    let chapter = store.get_chapter(task.chapter_id)?;
+    println!(
+        "Read '{}' (pages {}–{}): {}",
+        chapter.title, chapter.start_page, chapter.end_page, chapter.file_path
+    );
+    match ask_terminal("Finished reading? [Y/n] > ")? {
+        None => {
+            println!("(non-interactive: reading left pending — rerun to complete it.)");
+            return Ok(false);
+        }
+        Some(false) => {
+            println!("Reading left pending — next launch resumes here.");
+            return Ok(false);
+        }
+        Some(true) => {}
+    }
+    let today = parse_date(today_str)?;
+    match complete_and_advance(store, task.id, today, today_str)? {
+        Some(next) => println!(
+            "Task complete: Read '{}'. Scheduled follow-up: {} (due {}).",
+            chapter.title,
+            next.task_type.as_str(),
+            next.scheduled_for
+        ),
+        None => println!("Task complete: Read '{}'.", chapter.title),
+    }
+    Ok(true)
+}
+
+/// Generate-or-resume the stored MCQ set for a production chapter/attempt
+/// (§7.1): reuse validated rows when present, otherwise run one
+/// `complete_cached` generation (validated before caching) and persist it.
+/// Without connectivity and without stored rows there is nothing runnable —
+/// the LLM error propagates with state intact (§16: cached tasks still
+/// completable, rerun resumes).
+fn ensure_production_items(
+    store: &mut SqliteStore,
+    chapter: &domain::Chapter,
+    unit: &engines::UnitText,
+    phase: mcq::McqPhase,
+    today_str: &str,
+) -> Result<Vec<store::McqItem>> {
+    let items = store.list_mcq_items(chapter.id, phase.as_str(), chapter.attempt_no)?;
+    if !items.is_empty() {
+        println!(
+            "Resumed {} stored question(s) for {} ('{}').",
+            items.len(),
+            phase.as_str(),
+            chapter.title
+        );
+        return Ok(items);
+    }
+    println!(
+        "Generating {} questions for '{}' (pages {}–{}) …",
+        phase.as_str(),
+        chapter.title,
+        unit.page_start,
+        unit.page_end
+    );
+    let count = dev_mcq::DEV_MCQ_COUNT;
+    let prompt = match phase {
+        mcq::McqPhase::Pretest => mcq::build_pretest_prompt(unit, count),
+        mcq::McqPhase::Retest => mcq::build_retest_prompt(unit, count),
+        mcq::McqPhase::Review => {
+            return Err(Error::InvalidInput(
+                "review sets generate through ensure_review_items (they need misconception targets)".to_string(),
+            ));
+        }
+    };
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = dev_mcq::DEV_MCQ_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &mcq::mcq_response_schema(),
+        "mcq_set",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params = mcq::mcq_params_json(count, phase);
+    let source_hash = mcq::source_hash_for(&unit.text);
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today_str,
+    };
+    let operation = phase.as_str().to_string();
+    let request = llm::CachedRequest {
+        operation: operation.as_str(),
+        prompt: prompt.as_str(),
+        source_hash: source_hash.as_str(),
+        params_json: params.as_str(),
+    };
+    let unit_ref = unit;
+    let validate = |text: &str| {
+        mcq::validate_mcq_set(text, unit_ref).map(|_| text.trim().to_string())
+    };
+    let result = llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+    println!(
+        "Generated via LLM (cache: {}, transport sends: {}).",
+        if result.cache_hit { "hit" } else { "miss" },
+        result.transport_calls
+    );
+    let validated = mcq::validate_mcq_set(&result.text, unit)?;
+    let new_rows = dev_mcq::to_new_items_for(chapter.id, phase, &validated, chapter.attempt_no)?;
+    Ok(store.save_mcq_items(&new_rows)?)
+}
+
+/// Execute one due scheduler `PRETEST`/`RETEST` task against the production
+/// store: load the chapter corpus, generate-or-resume its question set, run
+/// the interactive session, and — only when every item is answered — advance
+/// the pipeline with the §15 checkpoint footer. Returns whether the task
+/// completed (early exits and offline waits return `false` with state saved).
+fn run_production_mcq(
+    store: &mut SqliteStore,
+    task_id: i64,
+    today: NaiveDate,
+    today_str: &str,
+) -> Result<bool> {
+    let task = store.get_task(task_id)?;
+    if task.status == TaskStatus::Done {
+        println!("Task already completed: {} — no state changed.", task.id);
+        return Ok(false);
+    }
+    let Some(phase) = mcq::McqPhase::for_task(task.task_type) else {
+        return Err(Error::InvalidInput(format!(
+            "task {} is {} — MCQ sessions only run pretest/retest",
+            task.id,
+            task.task_type.as_str()
+        )));
+    };
+    let chapter = store.get_chapter(task.chapter_id)?;
+    let unit = ingest::load_unit_text(std::path::Path::new(&chapter.file_path))?;
+    let items = ensure_production_items(store, &chapter, &unit, phase, today_str)?;
+    println!(
+        "\n{}: '{}' — {} question(s). Closed book, no notes.",
+        phase.as_str(),
+        chapter.title,
+        items.len()
+    );
+    let summary = run_mcq_session(store, &items, &unit, phase, chapter.id, chapter.attempt_no, None)?;
+    if !summary.completed {
+        return Ok(false);
+    }
+    let next = complete_and_advance(store, task.id, today, today_str)?;
+    println!(
+        "\nTask complete: {} — {} MCQ (Score: {}/{})",
+        chapter.title,
+        phase.as_str(),
+        summary.correct,
+        items.len()
+    );
+    println!(
+        "Misconceptions logged: {} item(s) added.",
+        summary.misconceptions
+    );
+    match next {
+        Some(followup) => println!(
+            "Scheduled follow-up: {} (due {}).",
+            followup.task_type.as_str(),
+            followup.scheduled_for
+        ),
+        None => println!("Chapter '{}' complete.", chapter.title),
+    }
+    Ok(true)
+}
+
+/// Join stored assignment parts into grading/display text (§7.2): parts were
+/// validated non-empty at generation time, so an empty result only means a
+/// corrupt row — the grader treats it as rubric-only (see
+/// `build_grading_prompt`), never as a silent pass.
+#[must_use]
+fn assignment_question_text(parts_json: &str) -> String {
+    let parts: Vec<String> = serde_json::from_str(parts_json).unwrap_or_default();
+    parts.join("\n")
+}
+
+/// Serialize per-criterion judgments into the `grades` row payload (§17).
+/// The shape mirrors the validator output (`name`, `score`, `max_score`,
+/// `comment`); serialization of an in-memory struct cannot fail in practice,
+/// and `"[]"` keeps a corrupt edge visible instead of panicking.
+#[must_use]
+fn criteria_results_json(results: &[grading::CriterionResult]) -> String {
+    let values: Vec<serde_json::Value> = results
+        .iter()
+        .map(|criterion| {
+            serde_json::json!({
+                "name": criterion.name,
+                "score": criterion.score,
+                "max_score": criterion.max_score,
+                "comment": criterion.comment,
+            })
+        })
+        .collect();
+    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Convert a validated grade into its store row (§7.3/§10): the awarded
+/// `score` is the original forever — disputes write `final_score` and never
+/// overwrite it (§9 audit trail).
+#[must_use]
+fn grade_to_new(
+    question_id: i64,
+    grade: &grading::Grade,
+    max_score: i64,
+    today_str: &str,
+) -> store::NewGrade {
+    store::NewGrade {
+        question_id,
+        score: grade.score,
+        max_score,
+        classification: grade.classification.as_str().to_string(),
+        criteria_results_json: criteria_results_json(&grade.criteria_results),
+        feedback: grade.feedback.clone(),
+        grader_version: llm::PROMPT_VERSION.to_string(),
+        created_at: today_str.to_string(),
+    }
+}
+
+/// Generate-or-resume the stored assignment set for a production
+/// chapter/attempt (§7.2): reuse validated rows when present, otherwise run
+/// one `complete_cached` generation (validated before caching, re-probing
+/// open misconceptions) and persist it. Without connectivity and without
+/// stored rows the LLM error propagates with state intact (§16).
+fn ensure_production_assignment_questions(
+    store: &mut SqliteStore,
+    chapter: &domain::Chapter,
+    unit: &engines::UnitText,
+    today_str: &str,
+) -> Result<Vec<store::AssignmentQuestion>> {
+    let items = store.list_assignment_questions(chapter.id, chapter.attempt_no)?;
+    if !items.is_empty() {
+        println!(
+            "Resumed {} stored assignment question(s) for '{}'.",
+            items.len(),
+            chapter.title
+        );
+        return Ok(items);
+    }
+    println!(
+        "Generating assignment for '{}' (pages {}–{}) …",
+        chapter.title, unit.page_start, unit.page_end
+    );
+    let open = open_misconceptions(store, chapter.id)?;
+    let prompt = assignment::build_assignment_prompt(unit, &open);
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = assignment::ASSIGNMENT_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &assignment::assignment_response_schema(),
+        "assignment_set",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let hash = assignment::misconceptions_hash(&open);
+    let params = assignment::assignment_params_json(&hash);
+    let source_hash = mcq::source_hash_for(&unit.text);
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today_str,
+    };
+    let operation = "assignment".to_string();
+    let request = llm::CachedRequest {
+        operation: operation.as_str(),
+        prompt: prompt.as_str(),
+        source_hash: source_hash.as_str(),
+        params_json: params.as_str(),
+    };
+    let unit_ref = unit;
+    let open_ref = &open;
+    let validate = |text: &str| {
+        assignment::validate_assignment_set(text, unit_ref, open_ref)
+            .map(|_| text.trim().to_string())
+    };
+    let result = llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+    println!(
+        "Generated via LLM (cache: {}, transport sends: {}).",
+        if result.cache_hit { "hit" } else { "miss" },
+        result.transport_calls
+    );
+    let validated = assignment::validate_assignment_set(&result.text, unit, &open)?;
+    let new_rows = assignment::to_new_questions(chapter.id, chapter.attempt_no, &validated)?;
+    store.save_assignment_questions(&new_rows)
+}
+
+/// Build misconception concept/description/evidence for a wrong assignment
+/// answer (§12): the question (truncated) as concept, the verdict plus
+/// feedback as description, and an answer excerpt as evidence. Pure and
+/// deterministic — the caller persists the triple.
+#[must_use]
+fn assignment_misconception_texts(
+    position: i64,
+    question_text: &str,
+    classification: &str,
+    score: i64,
+    max_score: i64,
+    feedback: &str,
+    answer: &str,
+) -> (String, String, String) {
+    fn truncate(text: &str, chars: usize) -> String {
+        let count = text.chars().count();
+        if count <= chars {
+            text.trim().to_string()
+        } else {
+            format!("{}...", text.chars().take(chars).collect::<String>())
+        }
+    }
+    let number = position.saturating_add(1);
+    let concept = format!("Assignment Q{number}: {}", truncate(question_text, 100));
+    let description = format!("Graded {classification} {score}/{max_score}: {feedback}");
+    let evidence = format!("Answer excerpt: {}", truncate(answer, 200));
+    (concept, description, evidence)
+}
+
+/// Apply the §12 lifecycle for one freshly saved grade: wrong verdicts log a
+/// new `ASSIGNMENT` row and push re-probed targets down substantially;
+/// full-credit verdicts push re-probed targets up substantially; blanks and
+/// defective questions carry no signal. Only `ACTIVE`/`IMPROVING` targets
+/// move — resolved rows never reopen here. Grade first, lifecycle second:
+/// the grade is the source of truth, and a crash between the two only skips
+/// a nudge that later outcomes correct.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+#[allow(clippy::too_many_lines)]
+fn apply_grade_lifecycle(
+    store: &mut SqliteStore,
+    question: &store::AssignmentQuestion,
+    grade: &grading::Grade,
+    max_score: i64,
+    answer_text: &str,
+    today_str: &str,
+) -> Result<()> {
+    let number = question.position.saturating_add(1);
+    let targets: Vec<i64> = serde_json::from_str(&question.target_misconception_ids).map_or_else(
+        |_: serde_json::Error| {
+            println!("Question {number} has corrupt re-probe targets — skipping confidence updates.");
+            Vec::new()
+        },
+        |ids| ids,
+    );
+    let chapter_id = question.chapter_id;
+    if misconceptions::should_log_assignment_misconception(grade.classification) {
+        let question_text = assignment_question_text(&question.parts_json);
+        let (concept, description, evidence) = assignment_misconception_texts(
+            question.position,
+            &question_text,
+            grade.classification.as_str(),
+            grade.score,
+            max_score,
+            &grade.feedback,
+            answer_text,
+        );
+        store.create_misconception(chapter_id, &concept, &description, &evidence, "ASSIGNMENT", today_str)?;
+        println!("Misconception logged: {concept}");
+        nudge_targeted_misconceptions(store, chapter_id, &targets, false, today_str)?;
+    } else if misconceptions::is_assignment_correct(grade.classification) {
+        nudge_targeted_misconceptions(store, chapter_id, &targets, true, today_str)?;
+    }
+    Ok(())
+}
+
+/// Push one lifecycle step onto re-probed target rows (§12: assignment-sized
+/// deltas). `correct` selects the direction. Unknown ids are reported and
+/// skipped — a stale target never fails grading.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn nudge_targeted_misconceptions(
+    store: &mut SqliteStore,
+    chapter_id: i64,
+    target_ids: &[i64],
+    correct: bool,
+    today_str: &str,
+) -> Result<()> {
+    if target_ids.is_empty() {
+        return Ok(());
+    }
+    let rows = store.list_misconceptions(chapter_id)?;
+    for target in target_ids {
+        let Some(row) = rows.iter().find(|row| row.id == *target) else {
+            println!("Re-probed misconception {target} is gone — skipping its confidence update.");
+            continue;
+        };
+        if row.status != "ACTIVE" && row.status != "IMPROVING" {
+            continue;
+        }
+        let step = misconceptions::apply_outcome(row.confidence, &row.status, correct, true);
+        let resolved_at = if step.just_resolved {
+            Some(today_str)
+        } else {
+            row.resolved_at.as_deref()
+        };
+        store.update_misconception(row.id, step.confidence, step.status, today_str, resolved_at)?;
+        if step.just_resolved {
+            println!("Misconception resolved: {}", row.concept_description);
+        } else {
+            let direction = if correct { "improving" } else { "worsening" };
+            println!(
+                "Misconception {direction}: {} (confidence {:.2} → {:.2})",
+                row.concept_description, row.confidence, step.confidence
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Grade every answered production assignment question against its frozen
+/// rubric (§7.3/§10) via `complete_cached` (validated before caching) and
+/// persist each verdict with `save_grade`. Questions with a stored grade are
+/// skipped so reruns resume; `QUESTION_DEFECTIVE` awards full credit and is
+/// flagged, never penalizing the user. Returns graded + resumed totals.
+fn run_production_grading(
+    store: &mut SqliteStore,
+    questions: &[store::AssignmentQuestion],
+    today_str: &str,
+) -> Result<(usize, i64, i64)> {
+    let mut graded = 0_usize;
+    let mut earned = 0_i64;
+    let mut possible = 0_i64;
+    for question in questions {
+        let responses = store.list_assignment_responses(question.id)?;
+        let Some(latest) = responses.last() else {
+            return Err(Error::InvalidInput(format!(
+                "question {} has no saved answer — complete every answer before grading",
+                question.id
+            )));
+        };
+        if !store.list_grades_for_question(question.id)?.is_empty() {
+            let existing = store.list_grades_for_question(question.id)?;
+            if let Some(first) = existing.first() {
+                earned = earned.saturating_add(first.final_score.unwrap_or(first.score));
+                possible = possible.saturating_add(first.max_score);
+                graded = graded.saturating_add(1);
+            }
+            continue;
+        }
+        let rubric = grading::parse_rubric_json(&question.rubric_json)?;
+        let question_text = assignment_question_text(&question.parts_json);
+        let prompt = grading::build_grading_prompt(&question_text, &rubric, &latest.answer_text);
+        let mut config = llm::LlmConfig::from_env()?;
+        config.max_tokens = grading::GRADING_MAX_TOKENS;
+        config.response_format_json = Some(llm::response_format_envelope(
+            &grading::grade_response_schema(&rubric),
+            "grade",
+        ));
+        let provider = llm::HttpLlmProvider::new(config)?;
+        let params = grading::grade_params_json_for(&rubric);
+        let source_hash =
+            grading::grade_source_hash(&question_text, &question.rubric_json, &latest.answer_text);
+        let hooks = llm::RunHooks {
+            sleep: &std::thread::sleep,
+            now_iso: today_str,
+        };
+        let operation = "grade".to_string();
+        let request = llm::CachedRequest {
+            operation: operation.as_str(),
+            prompt: prompt.as_str(),
+            source_hash: source_hash.as_str(),
+            params_json: params.as_str(),
+        };
+        let rubric_ref = &rubric;
+        let validate = |text: &str| {
+            grading::validate_grade(text, rubric_ref).map(|_| text.trim().to_string())
+        };
+        let result = llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+        let grade = grading::validate_grade(&result.text, &rubric)?;
+        let saved = store.save_grade(&grade_to_new(
+            question.id,
+            &grade,
+            rubric.max_score,
+            today_str,
+        ))?;
+        apply_grade_lifecycle(store, question, &grade, rubric.max_score, &latest.answer_text, today_str)?;        earned = earned.saturating_add(saved.score);
+        possible = possible.saturating_add(saved.max_score);
+        graded = graded.saturating_add(1);
+        println!(
+            "Graded {}/{}: {} — {}/{}",
+            question.position.saturating_add(1),
+            questions.len(),
+            grade.classification.as_str(),
+            grade.score,
+            rubric.max_score
+        );
+        println!("Feedback: {}", grade.feedback);
+        if grade.classification == grading::GradeClass::QuestionDefective {
+            println!(
+                "(QUESTION_DEFECTIVE never penalizes the user: full credit, item flagged for replacement.)"
+            );
+        }
+    }
+    Ok((graded, earned, possible))
+}
+
+/// Execute one due scheduler `ASSIGNMENT_WRITE` task against the production
+/// store: generate-or-resume the set (re-probing open misconceptions),
+/// collect closed-book answers in `nvim`, grade each answer against its
+/// frozen rubric, and — only when every question is answered and graded —
+/// advance the pipeline with the §15 checkpoint footer. Returns whether the
+/// task completed (early exits return `false` with state saved; rerun
+/// resumes answers, then grades).
+fn run_production_assignment(
+    store: &mut SqliteStore,
+    task_id: i64,
+    today: NaiveDate,
+    today_str: &str,
+) -> Result<bool> {
+    let task = store.get_task(task_id)?;
+    if task.status == TaskStatus::Done {
+        println!("Task already completed: {} — no state changed.", task.id);
+        return Ok(false);
+    }
+    if task.task_type != TaskType::AssignmentWrite {
+        return Err(Error::InvalidInput(format!(
+            "task {} is {} — assignment sessions only run assignment_write",
+            task.id,
+            task.task_type.as_str()
+        )));
+    }
+    let chapter = store.get_chapter(task.chapter_id)?;
+    let unit = ingest::load_unit_text(std::path::Path::new(&chapter.file_path))?;
+    let items = ensure_production_assignment_questions(store, &chapter, &unit, today_str)?;
+    println!(
+        "\nAssignment: '{}' — {} question(s). Closed book, no notes.",
+        chapter.title,
+        items.len()
+    );
+    print_assignment_set(&items);
+    if !std::io::stdin().is_terminal() {
+        println!("(non-interactive: assignment left pending — rerun to answer it.)");
+        return Ok(false);
+    }
+    require_nvim()?;
+    if !run_assignment_answers(store, &items, chapter.attempt_no)? {
+        return Ok(false);
+    }
+    let (graded, earned, possible) = run_production_grading(store, &items, today_str)?;
+    let next = complete_and_advance(store, task.id, today, today_str)?;
+    println!(
+        "\nTask complete: {} — Assignment graded ({graded}/{}) (Score: {earned}/{possible})",
+        chapter.title,
+        items.len()
+    );
+    match next {
+        Some(followup) => println!(
+            "Scheduled follow-up: {} (due {}).",
+            followup.task_type.as_str(),
+            followup.scheduled_for
+        ),
+        None => println!("Chapter '{}' complete.", chapter.title),
+    }
+    Ok(true)
+}
+
+/// Collect every graded answer for a chapter/attempt as notes input (§11
+/// items 4–5): the frozen verdict plus feedback per question. Questions
+/// without a stored grade are reported and skipped — notes stay generatable
+/// even when one grade is missing, and the gap is visible, never silent.
+fn grade_summaries_for(
+    store: &SqliteStore,
+    chapter_id: i64,
+    attempt_no: i64,
+) -> Result<Vec<notes::GradeSummary>> {
+    let mut out = Vec::new();
+    for question in store.list_assignment_questions(chapter_id, attempt_no)? {
+        let grades = store.list_grades_for_question(question.id)?;
+        let Some(latest) = grades.last() else {
+            println!(
+                "Question {} has no grade yet — leaving it out of the notes.",
+                question.position.saturating_add(1)
+            );
+            continue;
+        };
+        out.push(notes::GradeSummary {
+            question: assignment_question_text(&question.parts_json),
+            score: latest.final_score.unwrap_or(latest.score),
+            max_score: latest.max_score,
+            classification: latest.classification.clone(),
+            feedback: latest.feedback.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Map every tracked misconception onto notes input (§11 item 3, §12): open
+/// rows are highlighted with corrections, resolved rows are noted as cleared.
+/// All rows pass through so future lifecycle transitions flow without an
+/// engine change.
+fn misconception_items_for(rows: &[store::Misconception]) -> Vec<notes::MisconceptionItem> {
+    rows.iter()
+        .map(|row| notes::MisconceptionItem {
+            concept: row.concept_description.clone(),
+            evidence: row.evidence.clone(),
+            status: row.status.clone(),
+        })
+        .collect()
+}
+
+/// MCQ fraction for one chapter/phase/attempt (§13 performance): correct over
+/// answered items (latest response per item; unanswered items are excluded,
+/// never counted as wrong).
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn mcq_fraction(
+    store: &dyn Store,
+    chapter_id: i64,
+    phase: &str,
+    attempt_no: i64,
+) -> Result<(u64, u64)> {
+    let mut correct = 0_u64;
+    let mut answered = 0_u64;
+    for item in store.list_mcq_items(chapter_id, phase, attempt_no)? {
+        let responses = store.list_mcq_responses(item.id)?;
+        if let Some(latest) = responses.last() {
+            answered = answered.saturating_add(1);
+            if latest.is_correct {
+                correct = correct.saturating_add(1);
+            }
+        }
+    }
+    Ok((correct, answered))
+}
+
+/// Assignment fraction for one chapter/attempt (§13 performance): effective
+/// points (post-dispute `final_score`, else `score`) over rubric points,
+/// latest grade per question. Ungraded questions contribute nothing.
+///
+/// # Errors
+///
+/// Returns [`Error::Store`] on corrupt negative stored scores, and
+/// propagates backend failures.
+fn assignment_fraction(
+    store: &dyn Store,
+    chapter_id: i64,
+    attempt_no: i64,
+) -> Result<(u64, u64)> {
+    let mut earned = 0_u64;
+    let mut possible = 0_u64;
+    for question in store.list_assignment_questions(chapter_id, attempt_no)? {
+        let grades = store.list_grades_for_question(question.id)?;
+        if let Some(latest) = grades.last() {
+            let effective = latest.final_score.unwrap_or(latest.score);
+            let points = u64::try_from(effective).map_err(|e| {
+                Error::Store(format!("grade {} has corrupt score: {e}", latest.id))
+            })?;
+            let total = u64::try_from(latest.max_score).map_err(|e| {
+                Error::Store(format!("grade {} has corrupt max_score: {e}", latest.id))
+            })?;
+            earned = earned.saturating_add(points);
+            possible = possible.saturating_add(total);
+        }
+    }
+    Ok((earned, possible))
+}
+
+/// Open vs. resolved tally for one chapter (§13 misconceptions): `ACTIVE` +
+/// `IMPROVING` vs. `RESOLVED`. `DISPUTED` rows are purged evidence and count
+/// toward neither side.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn misconception_tally(store: &dyn Store, chapter_id: i64) -> Result<(u64, u64)> {
+    let mut active = 0_u64;
+    let mut resolved = 0_u64;
+    for row in store.list_misconceptions(chapter_id)? {
+        if row.status == "ACTIVE" || row.status == "IMPROVING" {
+            active = active.saturating_add(1);
+        } else if row.status == "RESOLVED" {
+            resolved = resolved.saturating_add(1);
+        }
+    }
+    Ok((active, resolved))
+}
+
+/// Evidence snapshot for one live (non-skipped) chapter on its current
+/// attempt (§13): MCQ fractions, effective assignment scores, and the
+/// misconception tally, plus the completion date for pace (latest live `DONE`
+/// task, only when the chapter itself is `Completed`).
+///
+/// # Errors
+///
+/// Propagates corrupt-score and backend failures from the helpers above.
+fn chapter_evidence(
+    store: &dyn Store,
+    chapter: &domain::Chapter,
+) -> Result<metrics::ChapterEvidence> {
+    let raw_pages = domain::unit_page_count(chapter.start_page, chapter.end_page).unwrap_or(0);
+    let pages = u64::try_from(raw_pages)
+        .map_err(|e| Error::Store(format!("chapter {} has corrupt pages: {e}", chapter.id)))?;
+    let chapter_id = chapter.id;
+    let attempt_no = chapter.attempt_no;
+    let live_tasks: Vec<Task> = store
+        .list_tasks()?
+        .into_iter()
+        .filter(|t| t.chapter_id == chapter_id && t.attempt_no == attempt_no)
+        .collect();
+    let completed_on = if chapter.status == domain::ChapterStatus::Completed {
+        live_tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done)
+            .filter_map(|t| {
+                t.completed_at
+                    .as_deref()
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            })
+            .max()
+    } else {
+        None
+    };
+    let (pretest_correct, pretest_answered) =
+        mcq_fraction(store, chapter.id, "pretest", chapter.attempt_no)?;
+    let (retest_correct, retest_answered) =
+        mcq_fraction(store, chapter.id, "retest", chapter.attempt_no)?;
+    let (assignment_earned, assignment_possible) =
+        assignment_fraction(store, chapter.id, chapter.attempt_no)?;
+    let (active_misconceptions, resolved_misconceptions) =
+        misconception_tally(store, chapter.id)?;
+    Ok(metrics::ChapterEvidence {
+        title: chapter.title.clone(),
+        status: chapter.status,
+        pages,
+        completed_on,
+        pretest_correct,
+        pretest_answered,
+        retest_correct,
+        retest_answered,
+        assignment_earned,
+        assignment_possible,
+        active_misconceptions,
+        resolved_misconceptions,
+    })
+}
+
+/// Generate-or-resume the stored notes for a production chapter/attempt
+/// (§11): reuse the validated document when present, otherwise run one
+/// `complete_cached` synthesis (validated before caching) over the chapter
+/// text plus misconception and grading evidence, and persist it. Without
+/// connectivity and without stored notes the LLM error propagates with state
+/// intact (§16).
+fn ensure_production_notes(
+    store: &mut SqliteStore,
+    chapter: &domain::Chapter,
+    unit: &engines::UnitText,
+    today_str: &str,
+) -> Result<store::Note> {
+    let existing = store.list_notes(chapter.id, chapter.attempt_no)?;
+    if let Some(first) = existing.into_iter().next() {
+        println!(
+            "Resumed stored notes for '{}' ({} chars).",
+            chapter.title,
+            first.content_markdown.chars().count()
+        );
+        return Ok(first);
+    }
+    println!(
+        "Generating notes for '{}' (pages {}–{}) …",
+        chapter.title, unit.page_start, unit.page_end
+    );
+    let misconceptions =
+        misconception_items_for(&store.list_misconceptions(chapter.id)?);
+    let grades = grade_summaries_for(store, chapter.id, chapter.attempt_no)?;
+    if grades.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "chapter {} has no graded answers — grade the assignment before synthesizing notes",
+            chapter.id
+        )));
+    }
+    let prompt = notes::build_notes_prompt(unit, &misconceptions, &grades);
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = notes::NOTES_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &notes::notes_response_schema(),
+        "notes",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params = notes::notes_params_json();
+    let source_hash = notes::notes_source_hash_for(&unit.text, &misconceptions, &grades);
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today_str,
+    };
+    let operation = "notes".to_string();
+    let request = llm::CachedRequest {
+        operation: operation.as_str(),
+        prompt: prompt.as_str(),
+        source_hash: source_hash.as_str(),
+        params_json: params.as_str(),
+    };
+    let validate =
+        |text: &str| notes::validate_notes(text).map(|_| text.trim().to_string());
+    let result = llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+    println!(
+        "Generated via LLM (cache: {}, transport sends: {}).",
+        if result.cache_hit { "hit" } else { "miss" },
+        result.transport_calls
+    );
+    let validated = notes::validate_notes(&result.text)?;
+    let row = notes::to_new_note(chapter.id, chapter.attempt_no, &validated, today_str);
+    store.save_note(&row)
+}
+
+/// Execute one due scheduler `NOTES` task against the production store:
+/// synthesize the six-section personalized notes from chapter text plus
+/// misconception and grading evidence, print them, and advance the pipeline
+/// (chapter `COMPLETED`, next chapter unlocked). Returns whether the task
+/// completed.
+fn run_production_notes(
+    store: &mut SqliteStore,
+    task_id: i64,
+    today: NaiveDate,
+    today_str: &str,
+) -> Result<bool> {
+    let task = store.get_task(task_id)?;
+    if task.status == TaskStatus::Done {
+        println!("Task already completed: {} — no state changed.", task.id);
+        return Ok(false);
+    }
+    if task.task_type != TaskType::Notes {
+        return Err(Error::InvalidInput(format!(
+            "task {} is {} — notes sessions only run notes",
+            task.id,
+            task.task_type.as_str()
+        )));
+    }
+    let chapter = store.get_chapter(task.chapter_id)?;
+    let unit = ingest::load_unit_text(std::path::Path::new(&chapter.file_path))?;
+    let note = ensure_production_notes(store, &chapter, &unit, today_str)?;
+    println!("\nChapter notes: '{}'\n", chapter.title);
+    println!("{}", note.content_markdown);
+    let next = complete_and_advance(store, task.id, today, today_str)?;
+    println!("\nTask complete: {} — Notes synthesized.", chapter.title);
+    match next {
+        Some(followup) => println!(
+            "Scheduled follow-up: {} (due {}).",
+            followup.task_type.as_str(),
+            followup.scheduled_for
+        ),
+        None => println!("Chapter '{}' complete.", chapter.title),
+    }
+    Ok(true)
+}
+
+/// Default entrypoint: today's scheduled loop (§15 checkpoint & resume).
+/// Each pass tops up scheduler state, runs the head due task through its
+/// stage, then offers the actual next due task (or names the nearest future
+/// one when the queue clears) — only an explicit `y` chains forward; Enter
+/// exits. The footer on a completed task only describes its scheduled
+/// follow-up, never what the loop does next. A clear queue prints the same
+/// day-complete footer whether the loop just drained it or the run started
+/// with it clear, so reruns hold steady until an explicit `cadence pull`.
+/// `<Enter>` (or `Ctrl-C`/`Ctrl-D`) exits cleanly with full persistence;
+/// relaunch resumes exactly here.
+fn run_daily_loop(store: &mut SqliteStore, today: NaiveDate, today_str: &str) -> Result<()> {
+    loop {
+        let _ = ensure_all_books(store, today, today_str)?;
+        let queue = today_queue(&store.list_tasks()?, today);
+        let Some(head) = queue.first() else {
+            print_day_complete(store, today)?;
+            return Ok(());
+        };
+        let task = head.clone();
+        // Pre-chapter gate (§4.1): fresh pretests offer proceed/skip/exit.
+        if task.task_type == TaskType::Pretest {
+            let chapter = store.get_chapter(task.chapter_id)?;
+            if chapter.status == domain::ChapterStatus::PretestReady {
+                match gate_chapter_start(store, &chapter, today_str)? {
+                    ChapterGate::Proceed => {}
+                    ChapterGate::Skip => continue,
+                    ChapterGate::Exit => {
+                        println!("Exiting — state saved; rerun to resume.");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let progressed = match task.task_type {
+            TaskType::Pretest | TaskType::Retest => {
+                run_production_mcq(store, task.id, today, today_str)?
+            }
+            TaskType::Read => run_reading_task(store, &task, today_str)?,
+            TaskType::AssignmentWrite => {
+                run_production_assignment(store, task.id, today, today_str)?
+            }
+            TaskType::Notes => run_production_notes(store, task.id, today, today_str)?,
+        };
+        if !progressed {
+            return Ok(());
+        }
+        // Top up before prompting so the offer names real work: same-chapter
+        // follow-ups (e.g. pretest → read) are executable now, while the next
+        // chapter's first pretest lands tomorrow (pullable via `cadence pull`).
+        let _ = ensure_all_books(store, today, today_str)?;
+        let (due, _) = due_and_future(&store.list_tasks()?, today);
+        if let Some(next) = due.first() {
+            let what = describe_task(store, next)?;
+            if !ask_continue(&format!("Next up: {what}. Continue? [y/N] > "))? {
+                println!("Exiting — state saved; rerun to resume.");
+                return Ok(());
+            }
+        } else {
+            print_day_complete(store, today)?;
+            return Ok(());
+        }
+    }
+}
+
+/// Day-complete footer, shared by the drained-queue and started-clear paths:
+/// names the nearest future task when one exists, always points at
+/// `cadence pull` for more work today, then exits with state saved.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] when the nearest future task's chapter is
+/// missing (corrupt store).
+fn print_day_complete(store: &SqliteStore, today: NaiveDate) -> Result<()> {
+    let (_, future) = due_and_future(&store.list_tasks()?, today);
+    match future.first() {
+        Some(next) => {
+            let what = describe_task(store, next)?;
+            println!("All tasks complete today. Next scheduled: {what}.");
+        }
+        None => println!("All tasks complete today — nothing scheduled ahead."),
+    }
+    println!("To pull more work forward today, run `cadence pull`.");
+    println!("Exiting — state saved; rerun to resume.");
+    Ok(())
+}
+
+/// Partition pending tasks into due-today (executable now, §6 order) and
+/// future work (date, then creation order). Pure over a task slice so the
+/// loop prompt never names a task it cannot run.
+fn due_and_future(tasks: &[Task], today: NaiveDate) -> (Vec<Task>, Vec<Task>) {
+    let mut future: Vec<Task> = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Pending && task.scheduled_for > today)
+        .cloned()
+        .collect();
+    future.sort_by(|a, b| {
+        a.scheduled_for
+            .cmp(&b.scheduled_for)
+            .then_with(|| a.sequence.cmp(&b.sequence))
+    });
+    (today_queue(tasks, today), future)
+}
+
+/// Last date a `days`-day horizon covers: `today + days`, saturating on
+/// overflow (unreachable for real schedules). Non-positive spans collapse to
+/// `today`, which excludes everything future-dated.
+fn horizon_end(today: NaiveDate, days: i64) -> NaiveDate {
+    if days < 1 {
+        return today;
+    }
+    today
+        .checked_add_days(chrono::Days::new(u64::try_from(days).unwrap_or(0)))
+        .unwrap_or(today)
+}
+
+/// Pending future tasks within the next `days` days.
+///
+/// Strictly after `today` (the queue section already covers due work), up to
+/// and including the horizon — ordered by date, then §6 rank. Pure over a
+/// task slice.
+#[must_use]
+pub fn upcoming_tasks(tasks: &[Task], today: NaiveDate, days: i64) -> Vec<Task> {
+    if days < 1 {
+        return Vec::new();
+    }
+    let end = horizon_end(today, days);
+    let mut out: Vec<Task> = tasks
+        .iter()
+        .filter(|task| {
+            task.status == TaskStatus::Pending
+                && task.scheduled_for > today
+                && task.scheduled_for <= end
+        })
+        .cloned()
+        .collect();
+    out.sort_by_key(|task| (task.scheduled_for, execution_rank(task, today)));
+    out
+}
+
+/// Print pending future tasks within the next `days` days, grouped by date
+/// with chapter titles, plus a count of anything scheduled beyond the
+/// horizon so the calendar view never silently truncates.
+fn print_upcoming(store: &SqliteStore, tasks: &[Task], today: NaiveDate, days: i64) {
+    let upcoming = upcoming_tasks(tasks, today, days);
+    if upcoming.is_empty() {
+        println!("Nothing scheduled in the next {days} day(s).");
+    } else {
+        println!("Coming up (next {days} day(s)):");
+        let mut current: Option<NaiveDate> = None;
+        for task in &upcoming {
+            if current != Some(task.scheduled_for) {
+                current = Some(task.scheduled_for);
+                println!("  {}:", task.scheduled_for);
+            }
+            println!(
+                "    [{}] {}",
+                task.task_type.as_str(),
+                chapter_title_or_id(store, task.chapter_id)
+            );
+        }
+    }
+    let end = horizon_end(today, days);
+    let beyond = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Pending && task.scheduled_for > end)
+        .count();
+    if beyond > 0 {
+        println!("…and {beyond} more task(s) beyond {end}.");
+    }
+}
+
+/// One-line description of a scheduled task with its chapter title.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] when the chapter is missing (corrupt store).
+fn describe_task(store: &SqliteStore, task: &Task) -> Result<String> {
+    let chapter = store.get_chapter(task.chapter_id)?;
+    Ok(format!(
+        "{} '{}' (due {})",
+        task.task_type.as_str(),
+        chapter.title,
+        task.scheduled_for
+    ))
+}
+
+/// Chapter title for display; falls back to `chapter {id}` when the row is
+/// missing so a read-only listing never fails on a corrupt store.
+fn chapter_title_or_id(store: &SqliteStore, chapter_id: i64) -> String {
+    store.get_chapter(chapter_id).map_or_else(
+        |_| format!("chapter {chapter_id}"),
+        |chapter| format!("'{}'", chapter.title),
+    )
+}
+
+/// Print the executable queue for `today`, naming chapters by title.
+fn print_queue(store: &SqliteStore, tasks: &[Task], today: NaiveDate) {
+    let queue = today_queue(tasks, today);
+    let overdue = overdue_tasks(tasks, today);
+    if queue.is_empty() {
+        println!("No tasks due for {today}. Queue is clear.");
+        return;
+    }
+    if !overdue.is_empty() {
+        println!("Overdue ({}):", overdue.len());
+        for task in &overdue {
+            println!(
+                "  [{}] {} — {} (scheduled {})",
+                task.task_type.as_str(),
+                chapter_title_or_id(store, task.chapter_id),
+                classify_label(task, today),
+                task.scheduled_for
+            );
+        }
+    }
+    println!("Today's queue ({}) for {today}:", queue.len());
+    for (position, task) in queue.iter().enumerate() {
+        let Some(number) = position.checked_add(1) else {
+            continue;
+        };
+        println!(
+            "  {number}. [{}] {} (scheduled {})",
+            task.task_type.as_str(),
+            chapter_title_or_id(store, task.chapter_id),
+            task.scheduled_for
+        );
+    }
+}
+
+/// Short bucket label for display.
+fn classify_label(task: &Task, today: NaiveDate) -> &'static str {
+    match classify_task(task, today) {
+        scheduler::TaskBucket::Overdue => "OVERDUE",
+        scheduler::TaskBucket::DueToday => "DUE TODAY",
+        scheduler::TaskBucket::Future => "FUTURE",
+        scheduler::TaskBucket::Done => "DONE",
+    }
+}
+
+/// First line of `text`, truncated to `chars` characters with an ellipsis.
+#[must_use]
+fn snip(text: &str, chars: usize) -> String {
+    let first = text.lines().next().unwrap_or("");
+    if first.chars().count() <= chars {
+        return first.to_string();
+    }
+    format!("{}...", first.chars().take(chars).collect::<String>())
+}
+
+/// Evidence dashboard (§13): completion, performance fractions, retention
+/// proxy, misconception resolution, trailing pace + ETA, consistency, and
+/// learning debt. Skipped chapters are excluded from every denominator.
+/// Observed numbers only — no mastery scores.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+#[allow(clippy::too_many_lines)]
+fn run_metrics(store: &SqliteStore, today: NaiveDate) -> Result<()> {
+    let mut chapters = Vec::new();
+    for book in store.list_books()? {
+        chapters.extend(store.list_chapters(book.id)?);
+    }
+    let skipped = count_skipped(&chapters);
+    let live: Vec<&domain::Chapter> = chapters
+        .iter()
+        .filter(|c| !c.status.is_skipped())
+        .collect();
+    // Metrics only consider live rows: tasks on skipped chapters or from
+    // abandoned attempts are audit trail, not evidence (§4.1).
+    let live_tasks: Vec<Task> = store
+        .list_tasks()?
+        .into_iter()
+        .filter(|t| {
+            chapters.iter().find(|c| c.id == t.chapter_id).is_some_and(|c| {
+                !c.status.is_skipped() && t.attempt_no == c.attempt_no
+            })
+        })
+        .collect();
+    let tasks_done = live_tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Done)
+        .count();
+    let mut evidence = Vec::with_capacity(live.len());
+    for chapter in &live {
+        evidence.push(chapter_evidence(store, chapter)?);
+    }
+    let mut active_days = Vec::new();
+    let mut punctual = Vec::new();
+    for task in &live_tasks {
+        if task.status != TaskStatus::Done {
+            continue;
+        }
+        let Some(done) = task
+            .completed_at
+            .as_deref()
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        else {
+            continue;
+        };
+        active_days.push(done);
+        punctual.push((task.scheduled_for, done));
+    }
+    let overdue = overdue_tasks(&live_tasks, today);
+    let board = metrics::summarize(&metrics::DashboardInput {
+        chapters: &evidence,
+        tasks_done,
+        tasks_total: live_tasks.len(),
+        skipped,
+        active_days: &active_days,
+        punctual: &punctual,
+        overdue: overdue.len(),
+        today,
+    });
+    let units_total = board
+        .units_completed
+        .saturating_add(board.units_remaining);
+    println!(
+        "Completion: {}/{} units ({} pages done, {} left), {}/{} tasks done.",
+        board.units_completed,
+        units_total,
+        board.pages_completed,
+        board.pages_remaining,
+        board.tasks_done,
+        board.tasks_total
+    );
+    println!("Skipped: {} chapter(s) (excluded from completion).", board.skipped);
+    let (pretest_c, pretest_n) = board.pretest_fraction;
+    let (retest_c, retest_n) = board.retest_fraction;
+    let (assign_e, assign_p) = board.assignment_fraction;
+    println!(
+        "Performance: pretest {} · retest {} · assignment {}",
+        metrics::format_fraction(pretest_c, pretest_n),
+        metrics::format_fraction(retest_c, retest_n),
+        metrics::format_fraction(assign_e, assign_p)
+    );
+    println!(
+        "Retention proxy: {} → {} → {}",
+        metrics::format_percent(board.pretest),
+        metrics::format_percent(board.retest),
+        metrics::format_percent(board.assignment)
+    );
+    println!(
+        "Misconceptions: {} active, {} resolved (resolution rate {}).",
+        board.active_misconceptions,
+        board.resolved_misconceptions,
+        metrics::format_percent(board.resolution)
+    );
+    match board.pace.eta {
+        Some(_) if board.units_remaining == 0 => println!(
+            "Pace (last 7 days): {:.1} units/week, {:.1} pages/week — all units complete.",
+            board.pace.units_per_week, board.pace.pages_per_week
+        ),
+        Some(date) => println!(
+            "Pace (last 7 days): {:.1} units/week, {:.1} pages/week — ETA {date} ({} units left).",
+            board.pace.units_per_week, board.pace.pages_per_week, board.units_remaining
+        ),
+        None => println!(
+            "Pace (last 7 days): {:.1} units/week, {:.1} pages/week — ETA unknown (no completions in the last 7 days).",
+            board.pace.units_per_week, board.pace.pages_per_week
+        ),
+    }
+    println!(
+        "Consistency: {} days active, current streak {} (longest {}), on-time {}.",
+        board.consistency.days_active,
+        board.consistency.current_streak,
+        board.consistency.longest_streak,
+        metrics::format_percent(board.on_time)
+    );
+    if overdue.is_empty() {
+        println!("Learning debt: none.");
+    } else {
+        println!("Learning debt: {} overdue task(s):", overdue.len());
+        for task in &overdue {
+            let title = chapters
+                .iter()
+                .find(|c| c.id == task.chapter_id)
+                .map_or_else(|| "unknown chapter".to_string(), |c| c.title.clone());
+            println!(
+                "  [{}] '{title}' (chapter {}, scheduled {})",
+                task.task_type.as_str(),
+                task.chapter_id,
+                task.scheduled_for
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Active / resolved misconception list across all chapters (§12). Rows
+/// logged before a skip stay `ACTIVE` and remain under review (§4.1), so
+/// skipped chapters are included here (flagged) — unlike the metrics
+/// denominators above.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn run_misconceptions(store: &SqliteStore) -> Result<()> {
+    let mut active = 0_u64;
+    let mut resolved = 0_u64;
+    let mut disputed = 0_u64;
+    for book in store.list_books()? {
+        let mut printed_book = false;
+        for chapter in store.list_chapters(book.id)? {
+            let rows = store.list_misconceptions(chapter.id)?;
+            if rows.is_empty() {
+                continue;
+            }
+            if !printed_book {
+                println!("{}:", book.title);
+                printed_book = true;
+            }
+            let skipped_mark = if chapter.status.is_skipped() {
+                " [skipped — stays under review]"
+            } else {
+                ""
+            };
+            println!(
+                "  Chapter {} — '{}{skipped_mark}':",
+                chapter.index_in_book.saturating_add(1),
+                chapter.title
+            );
+            for row in &rows {
+                match row.status.as_str() {
+                    "ACTIVE" | "IMPROVING" => active = active.saturating_add(1),
+                    "RESOLVED" => resolved = resolved.saturating_add(1),
+                    "DISPUTED" => disputed = disputed.saturating_add(1),
+                    _ => {}
+                }
+                println!(
+                    "    [{}] {} (confidence {:.2}, logged {})\n      {}",
+                    row.status,
+                    row.concept_description,
+                    row.confidence,
+                    row.created_at,
+                    snip(&row.evidence, 120)
+                );
+            }
+        }
+    }
+    println!("{active} active, {resolved} resolved, {disputed} disputed (purged).");
+    Ok(())
+}
+
+/// Latest stored notes markdown for a chapter's current attempt (the notes
+/// of record; generate-or-resume reuses it on rerun).
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] for unknown chapters,
+/// [`Error::InvalidInput`] when the chapter has no notes yet.
+fn stored_notes_markdown(store: &dyn Store, chapter_id: i64) -> Result<String> {
+    let chapter = store.get_chapter(chapter_id)?;
+    let mut rows = store.list_notes(chapter.id, chapter.attempt_no)?;
+    rows.pop().map(|note| note.content_markdown).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "chapter {chapter_id} ('{}') has no notes yet — notes are synthesized after grading",
+            chapter.title
+        ))
+    })
+}
+
+/// `cadence notes [id]`: without args, list chapters with ids and whether
+/// notes exist on the current attempt; with an id, print the chapter's
+/// stored notes markdown (pipe into a pager for long notes).
+///
+/// # Errors
+///
+/// Propagates lookup failures from [`stored_notes_markdown`] and
+/// [`Error::Store`] from the backend.
+fn run_notes(store: &SqliteStore, id: Option<i64>) -> Result<()> {
+    let Some(wanted) = id else {
+        println!("Chapters with notes:");
+        for book in store.list_books()? {
+            let mut printed_book = false;
+            for chapter in store.list_chapters(book.id)? {
+                if store
+                    .list_notes(chapter.id, chapter.attempt_no)?
+                    .is_empty()
+                {
+                    continue;
+                }
+                if !printed_book {
+                    println!("Book {} — {}:", book.id, book.title);
+                    printed_book = true;
+                }
+                println!(
+                    "  {} '{}' (pages {}–{}, attempt {})",
+                    chapter.id,
+                    chapter.title,
+                    chapter.start_page,
+                    chapter.end_page,
+                    chapter.attempt_no,
+                );
+            }
+        }
+        println!("Usage: cadence notes <id> (pipe into a pager for long notes)");
+        return Ok(());
+    };
+    print!("{}", stored_notes_markdown(store, wanted)?);
+    Ok(())
+}
+
+/// Book-level progress with retention evidence (§13): per-chapter status,
+/// pages, MCQ/assignment fractions, and misconception tallies. Skipped
+/// chapters are listed separately, excluded from evidence.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn run_progress(store: &SqliteStore) -> Result<()> {
+    for book in store.list_books()? {
+        let chapters = store.list_chapters(book.id)?;
+        let live_count = chapters.iter().filter(|c| !c.status.is_skipped()).count();
+        let skipped_count = chapters.len().saturating_sub(live_count);
+        println!(
+            "{} — {live_count} unit(s), {skipped_count} skipped:",
+            book.title
+        );
+        for chapter in chapters.iter().filter(|c| !c.status.is_skipped()) {
+            let ev = chapter_evidence(store, chapter)?;
+            println!(
+                "  Ch{} '{}' [{}] pages {}–{}: pretest {} · retest {} · assignment {} · misconceptions {} active / {} resolved",
+                chapter.index_in_book.saturating_add(1),
+                chapter.title,
+                chapter.status.as_str(),
+                chapter.start_page,
+                chapter.end_page,
+                metrics::format_fraction(ev.pretest_correct, ev.pretest_answered),
+                metrics::format_fraction(ev.retest_correct, ev.retest_answered),
+                metrics::format_fraction(ev.assignment_earned, ev.assignment_possible),
+                ev.active_misconceptions,
+                ev.resolved_misconceptions
+            );
+        }
+        for chapter in chapters.iter().filter(|c| c.status.is_skipped()) {
+            println!(
+                "  Skipped: Ch{} '{}' (excluded from evidence)",
+                chapter.index_in_book.saturating_add(1),
+                chapter.title
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read one manual-boundaries line from interactive stdin.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] when stdin is not a terminal or yields no
+/// usable line.
+fn read_manual_from_stdin(leaf: &str) -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::NeedsManual(format!(
+            "{leaf} (re-run with --manual-boundaries start-end,...)"
+        )));
+    }
+    println!("{leaf}");
+    print!("Enter manual boundaries (start-end,start-end,...): ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let trimmed = line.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidInput(
+            "no manual boundaries entered".to_string(),
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Generate-or-resume the stored review set for a production chapter/attempt
+/// (§12): reuse the validated set when present, otherwise run one
+/// `complete_cached` targeted generation (shape- plus topic-validated before
+/// caching, so drift fast-retries with direction) over the chapter text and
+/// persist it. The target-set hash is part of the cache identity: a changed
+/// open set regenerates instead of serving stale questions. Without
+/// connectivity and without stored rows the LLM error propagates with state
+/// intact (§16).
+fn ensure_review_items(
+    store: &mut SqliteStore,
+    chapter: &domain::Chapter,
+    unit: &engines::UnitText,
+    targets: &[review::ReviewTarget],
+    today_str: &str,
+) -> Result<Vec<store::McqItem>> {
+    let items = store.list_mcq_items(
+        chapter.id,
+        mcq::McqPhase::Review.as_str(),
+        chapter.attempt_no,
+    )?;
+    if !items.is_empty() {
+        println!(
+            "Resumed {} stored review question(s) for '{}'.",
+            items.len(),
+            chapter.title
+        );
+        return Ok(items);
+    }
+    let count = review::review_question_count(targets.len());
+    println!(
+        "Generating {count} targeted review question(s) for '{}' (pages {}–{}) …",
+        chapter.title, unit.page_start, unit.page_end
+    );
+    let concepts = review::concepts_of(targets);
+    let prompt = mcq::build_review_prompt(unit, count, &concepts);
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = review::REVIEW_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &mcq::mcq_review_response_schema(),
+        "review_set",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params = review::review_params_json(count, &review::targets_hash(targets));
+    let source_hash = mcq::source_hash_for(&unit.text);
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today_str,
+    };
+    let operation = mcq::McqPhase::Review.as_str().to_string();
+    let request = llm::CachedRequest {
+        operation: operation.as_str(),
+        prompt: prompt.as_str(),
+        source_hash: source_hash.as_str(),
+        params_json: params.as_str(),
+    };
+    let unit_ref = unit;
+    let concepts_ref = &concepts;
+    let validate = |text: &str| {
+        let items = mcq::validate_mcq_set_ranged(text, unit_ref, count, count)?;
+        mcq::check_review_topics(&items, concepts_ref)?;
+        Ok(text.trim().to_string())
+    };
+    let result = llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+    println!(
+        "Generated via LLM (cache: {}, transport sends: {}).",
+        if result.cache_hit { "hit" } else { "miss" },
+        result.transport_calls
+    );
+    let validated = mcq::validate_mcq_set_ranged(&result.text, unit, count, count)?;
+    mcq::check_review_topics(&validated, &concepts)?;
+    let new_rows = dev_mcq::to_new_items_for(
+        chapter.id,
+        mcq::McqPhase::Review,
+        &validated,
+        chapter.attempt_no,
+    )?;
+    Ok(store.save_mcq_items(&new_rows)?)
+}
+
+/// Manual cumulative review (§12): pull every open misconception across
+/// completed (and skipped) chapters, generate-or-resume one targeted
+/// maximum-difficulty MCQ set per chapter, and run the interactive sessions
+/// in book order. Correct answers boost topic-matched rows (+0.1, resolving
+/// at threshold); wrong answers nudge them (−0.1); `"I don't know"`
+/// abstains with no lifecycle effect. Review never touches scheduler state
+/// — it is manual, outside the 3-day window. Chapters whose text cannot
+/// load are reported and skipped, never silent. Early exits keep
+/// per-question state for resume.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] and LLM failures; a failed chapter aborts the
+/// run with earlier chapters' state intact.
+fn run_review(store: &mut SqliteStore, today_str: &str) -> Result<()> {
+    let mut views = Vec::new();
+    for book in store.list_books()? {
+        for chapter in store.list_chapters(book.id)? {
+            let mut rows = Vec::new();
+            for row in store.list_misconceptions(chapter.id)? {
+                rows.push(review::MisconceptionView {
+                    id: row.id,
+                    concept: row.concept_description,
+                    description: row.description,
+                    evidence: row.evidence,
+                    status: row.status,
+                    confidence: row.confidence,
+                });
+            }
+            views.push(review::ChapterOpen {
+                chapter_id: chapter.id,
+                title: chapter.title.clone(),
+                status: chapter.status,
+                rows,
+            });
+        }
+    }
+    let targets = review::select_targets(&views);
+    if targets.is_empty() {
+        println!("No open misconceptions — nothing to review.");
+        return Ok(());
+    }
+    let mut index = 0_usize;
+    let mut chapters_done = 0_usize;
+    let mut total_correct = 0_usize;
+    let mut total_answered = 0_usize;
+    while let Some(head) = targets.get(index) {
+        let chapter_id = head.chapter_id;
+        let group_len = targets.get(index..).map_or(0, |rest| {
+            rest.iter()
+                .take_while(|target| target.chapter_id == chapter_id)
+                .count()
+        });
+        let Some(next) = index.checked_add(group_len) else {
+            break;
+        };
+        let Some(group) = targets.get(index..next) else {
+            break;
+        };
+        index = next;
+        if group.is_empty() {
+            continue;
+        }
+        let chapter = store.get_chapter(chapter_id)?;
+        let unit = match ingest::load_unit_text(std::path::Path::new(&chapter.file_path)) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                println!(
+                    "Skipping review for '{}': cannot load chapter text ({error}).",
+                    chapter.title
+                );
+                continue;
+            }
+        };
+        let items = ensure_review_items(store, &chapter, &unit, group, today_str)?;
+        println!(
+            "\nReview: '{}' — {} targeted question(s) re-probing {} misconception(s).",
+            chapter.title,
+            items.len(),
+            group.len()
+        );
+        let summary = run_mcq_session(
+            store,
+            &items,
+            &unit,
+            mcq::McqPhase::Review,
+            chapter.id,
+            chapter.attempt_no,
+            None,
+        )?;
+        if !summary.completed {
+            return Ok(());
+        }
+        chapters_done = chapters_done.saturating_add(1);
+        total_correct = total_correct.saturating_add(summary.correct);
+        total_answered = total_answered.saturating_add(summary.answered);
+        store.log_event(
+            "REVIEW_SESSION",
+            Some(chapter.id),
+            None,
+            Some(&format!("{}/{}", summary.correct, summary.answered)),
+            today_str,
+        )?;
+    }
+    println!(
+        "\nReview complete: {total_correct}/{total_answered} correct across {chapters_done} chapter(s)."
+    );
+    Ok(())
+}
+
+/// Destructive-action twin of [`ask_continue`]: same explicit-`y` rule, but
+/// piped stdin and EOF abort instead of proceeding, so a library wipe can
+/// never fire without an interactive yes.
+///
+/// # Errors
+///
+/// Propagates [`Error::Io`] on terminal read failures.
+fn ask_destructive(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    ask_continue(prompt)
+}
+
+/// Progress snapshot of one tracked book for the single-book ingest guard.
+struct BookProgress {
+    title: String,
+    done: u64,
+    total: u64,
+    skipped: u64,
+    pages_done: u64,
+    pages_total: u64,
+}
+
+/// Summarize one book's completion for the ingest guard: chapters completed
+/// vs tracked (skips called out, never counted as done) plus chapter pages.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from chapter listing.
+fn book_progress(store: &dyn Store, book: &domain::Book) -> Result<BookProgress> {
+    let mut progress = BookProgress {
+        title: book.title.clone(),
+        done: 0,
+        total: 0,
+        skipped: 0,
+        pages_done: 0,
+        pages_total: 0,
+    };
+    for chapter in store.list_chapters(book.id)? {
+        progress.total = progress.total.saturating_add(1);
+        let pages = domain::unit_page_count(chapter.start_page, chapter.end_page).unwrap_or(0);
+        let pages = u64::try_from(pages).unwrap_or(0);
+        progress.pages_total = progress.pages_total.saturating_add(pages);
+        if chapter.status == domain::ChapterStatus::Completed {
+            progress.done = progress.done.saturating_add(1);
+            progress.pages_done = progress.pages_done.saturating_add(pages);
+        } else if chapter.status.is_skipped() {
+            progress.skipped = progress.skipped.saturating_add(1);
+        }
+    }
+    Ok(progress)
+}
+
+/// One-line library summary, e.g.
+/// `Modern C: 1/22 (5%) chapters, 2 skipped, 10/391 pages`.
+#[must_use]
+fn format_book_progress(progress: &BookProgress) -> String {
+    let skipped = if progress.skipped == 0 {
+        String::new()
+    } else {
+        format!(", {} skipped", progress.skipped)
+    };
+    format!(
+        "  {}: {} chapters{skipped}, {}/{} pages",
+        progress.title,
+        metrics::format_fraction(progress.done, progress.total),
+        progress.pages_done,
+        progress.pages_total
+    )
+}
+
+/// Single-book guard (§3): `cadence` tracks one book at a time. When the
+/// store already holds books, show their progress and require an explicit
+/// `y` to wipe the library before ingesting `new_title`: every record goes
+/// (books, tasks, grades, notes, history) while the PDF file itself is kept
+/// and the content-addressed LLM cache survives. Returns whether ingest
+/// should proceed — anything but `y` aborts with the library untouched.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from listing/clearing and [`Error::Io`] from
+/// prompt reads and unit-cache removal.
+fn guard_single_book(
+    store: &mut dyn Store,
+    config: &Config,
+    new_title: &str,
+) -> Result<bool> {
+    let books = store.list_books()?;
+    if books.is_empty() {
+        return Ok(true);
+    }
+    if books.len() == 1 {
+        println!("Already tracking a book:");
+    } else {
+        println!("Already tracking {} books:", books.len());
+    }
+    for book in &books {
+        println!("{}", format_book_progress(&book_progress(store, book)?));
+    }
+    println!("Starting a new book deletes ALL existing records (books, tasks, grades, notes, history). The PDF file itself is kept.");
+    if !ask_destructive(&format!("Replace the library with '{new_title}'? [y/N] > "))? {
+        println!("Ingest aborted — existing library untouched.");
+        return Ok(false);
+    }
+    store.clear_library()?;
+    let mut books_dir = config.data_dir.clone();
+    books_dir.push("books");
+    if books_dir.exists() {
+        std::fs::remove_dir_all(&books_dir)?;
+    }
+    println!("Library cleared.");
+    Ok(true)
+}
+
+/// Real ingest: outline → split → extract → file store → book registration.
+#[allow(clippy::too_many_lines)]
+fn run_ingest(
+    pdf: &str,
+    start_page: i64,
+    max_unit_pages: i64,
+    title: Option<&str>,
+    manual: Option<&str>,
+    chapter_level: Option<i64>,
+    config: &Config,
+) -> Result<()> {
+    use std::path::Path;
+    domain::validate_book_registration(start_page)?;
+    if max_unit_pages < 1 {
+        return Err(Error::InvalidInput(
+            "--max-unit-pages must be >= 1".to_string(),
+        ));
+    }
+    let pdf_path = Path::new(pdf);
+    let resolved_title = title.map_or_else(
+        || ingest::default_title(pdf_path),
+        ToString::to_string,
+    );
+    let bytes = std::fs::read(pdf_path)?;
+    let hash = ingest::file_hash(&bytes);
+    let source = pdf::MuPdfSource::open(pdf_path)?;
+    let page_count = source.page_count();
+    if start_page > page_count {
+        return Err(Error::InvalidInput(format!(
+            "start page {start_page} exceeds document page count {page_count}"
+        )));
+    }
+    let boundaries = source.outline(start_page)?;
+    println!(
+        "{}",
+        split::describe_levels(&boundaries, start_page, page_count, chapter_level)
+    );
+    let planned = match ingest::plan_book(
+        &boundaries,
+        start_page,
+        page_count,
+        max_unit_pages,
+        manual,
+        chapter_level,
+    ) {
+        Ok(units) => units,
+        Err(Error::NeedsManual(msg)) if manual.is_none() => {
+            let line = read_manual_from_stdin(&msg)?;
+            ingest::plan_book(
+                &boundaries,
+                start_page,
+                page_count,
+                max_unit_pages,
+                Some(&line),
+                chapter_level,
+            )?
+        }
+        Err(other) => return Err(other),
+    };
+    let mut store = SqliteStore::open(&config.db_path(), &config.lock_path())?;
+    if !guard_single_book(&mut store, config, &resolved_title)? {
+        return Ok(());
+    }
+    let units = ingest::extract_units(&source, &planned, &hash)?;
+    let stored = ingest::store_units(&config.data_dir, &hash, &units)?;
+    let today = today_date().format("%Y-%m-%d").to_string();
+    let book = ingest::register_book(
+        &mut store,
+        &resolved_title,
+        pdf_path,
+        &hash,
+        start_page,
+        &units,
+        &stored,
+        &today,
+    )?;
+    let ingest_day = today_date();
+    let topped = ensure_tasks(&mut store, book.id, ingest_day, &today)?.len();
+    println!(
+        "ingested book {} ({resolved_title}): {} unit(s), hash {hash} ({topped} initial task(s) scheduled)",
+        book.id,
+        units.len()
+    );
+    for (index, unit) in units.iter().enumerate() {
+        let Some(number) = index.checked_add(1) else {
+            continue;
+        };
+        println!(
+            "  {number}. {} (pages {}–{}, level {})",
+            unit.heading, unit.start_page, unit.end_page, unit.level
+        );
+    }
+    Ok(())
+}
+
+/// `cadence dev ingest`: isolated outline + split + text, printed as JSON.
+/// Never mutates production storage.
+fn run_dev_ingest(
+    pdf_path: &str,
+    start_page: i64,
+    max_unit_pages: i64,
+    manual: Option<&str>,
+    chapter_level: Option<i64>,
+    max_units: Option<usize>,
+) -> Result<()> {
+    use std::path::Path;
+    let path = Path::new(pdf_path);
+    let source = pdf::MuPdfSource::open(path)?;
+    let page_count = source.page_count();
+    let boundaries = source.outline(start_page)?;
+    // Table goes to stderr: stdout stays pure unit JSON for scripting.
+    eprintln!(
+        "{}",
+        split::describe_levels(&boundaries, start_page, page_count, chapter_level)
+    );
+    let planned = ingest::plan_book(
+        &boundaries,
+        start_page,
+        page_count,
+        max_unit_pages,
+        manual,
+        chapter_level,
+    )?;
+    let take = max_units.unwrap_or(planned.len());
+    let capped: Vec<engines::PlannedUnit> =
+        planned.into_iter().take(take).collect();
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let hash = ingest::file_hash(&bytes);
+    let units = ingest::extract_units(&source, &capped, &hash)?;
+    let payloads: Vec<ingest::UnitPayload> = units
+        .iter()
+        .map(|u| ingest::UnitPayload {
+            heading: u.heading.clone(),
+            level: u.level,
+            page_start: u.start_page,
+            page_end: u.end_page,
+            text: u.text.text.clone(),
+            source_pdf_hash: hash.clone(),
+        })
+        .collect();
+    let json =
+        serde_json::to_string_pretty(&payloads).map_err(|e| Error::Io(e.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+/// Read a smoke prompt from piped stdin (`--prompt` not given).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] when stdin is a terminal (no piped input)
+/// or yields only blank text.
+fn read_prompt_from_stdin() -> Result<String> {
+    use std::io::Read as _;
+    if std::io::stdin().is_terminal() {
+        return Err(Error::InvalidInput(
+            "pass --prompt \"...\" or pipe a prompt on stdin".to_string(),
+        ));
+    }
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text)?;
+    if text.trim().is_empty() {
+        return Err(Error::InvalidInput("empty prompt on stdin".to_string()));
+    }
+    Ok(text)
+}
+
+/// `cadence dev llm`: real transport smoke test with durable job + cache.
+/// Uses an isolated scratch database (`.scratch/dev-llm/`); never touches
+/// production storage.
+fn run_dev_llm(operation: &str, prompt: Option<&str>, model: Option<&str>) -> Result<()> {
+    let mut config = llm::LlmConfig::from_env()?;
+    if let Some(name) = model {
+        if !name.trim().is_empty() {
+            config = config.with_model(name);
+        }
+    }
+    let prompt_text = prompt.map_or_else(
+        || read_prompt_from_stdin().map(|t| t.trim().to_string()),
+        |p| {
+            if p.trim().is_empty() {
+                Err(Error::InvalidInput("empty --prompt".to_string()))
+            } else {
+                Ok(p.trim().to_string())
+            }
+        },
+    )?;
+    let db_path = std::path::PathBuf::from(".scratch/dev-llm/cadence.db");
+    let lock_path = std::path::PathBuf::from(".scratch/dev-llm/cadence.lock");
+    let mut store = SqliteStore::open(&db_path, &lock_path)?;
+    let provider = llm::HttpLlmProvider::new(config.clone())?;
+    let params = format!("{{\"max_tokens\":{}}}", config.max_tokens);
+    let today = today_date().format("%Y-%m-%d").to_string();
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today.as_str(),
+    };
+    let result = llm::complete_cached(
+        &provider,
+        &mut store,
+        &llm::CachedRequest {
+            operation,
+            prompt: prompt_text.as_str(),
+            source_hash: "",
+            params_json: params.as_str(),
+        },
+        &llm::validate_smoke,
+        &hooks,
+    )?;
+    println!("model: {}", config.model);
+    println!(
+        "cache: {}",
+        if result.cache_hit { "hit" } else { "miss" }
+    );
+    println!("transport sends: {}", result.transport_calls);
+    println!("--- response ---\n{}", result.text);
+    println!(
+        "(paid upgrade target: {} — needs purchased credits)",
+        llm::UPGRADE_MODEL
+    );
+    Ok(())
+}
+/// First-unit context shared by the dev stage harnesses (§2.1).
+struct FirstUnit {
+    /// Extracted chapter text.
+    unit: engines::UnitText,
+    /// Hex SHA-256 of the PDF bytes (dev-book identity).
+    pdf_hash: String,
+    /// File name for display and dev-book titles.
+    pdf_name: String,
+}
+
+/// Resolve the first study unit of a fixture PDF: semantic outline + 50-page
+/// plan when available, otherwise the leading ≤50 pages as one unit (fixture
+/// PDFs are single chapters; never invent splits beyond that fallback).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] on bad page ranges and [`Error::Pdf`] on
+/// extraction failures.
+fn extract_first_unit(pdf_path: &str, start_page: i64) -> Result<FirstUnit> {
+    use std::path::Path;
+    if start_page < 1 {
+        return Err(Error::InvalidInput(
+            "--start-page must be >= 1 (one-based physical page)".to_string(),
+        ));
+    }
+    let path = Path::new(pdf_path);
+    let source = pdf::MuPdfSource::open(path)?;
+    let page_count = source.page_count();
+    if start_page > page_count {
+        return Err(Error::InvalidInput(format!(
+            "start page {start_page} exceeds document page count {page_count}"
+        )));
+    }
+    let pdf_bytes = std::fs::read(path).unwrap_or_default();
+    let pdf_hash = ingest::file_hash(&pdf_bytes);
+    let unit: engines::UnitText = match source.outline(start_page) {
+        Ok(boundaries) => {
+            match ingest::plan_book(&boundaries, start_page, page_count, 50, None, None) {
+                Ok(planned) => {
+                    let Some(first) = planned.first() else {
+                        return Err(Error::InvalidInput("no study units planned".to_string()));
+                    };
+                    let mut text =
+                        source.text_for_range(first.start_page, first.end_page)?;
+                    text.heading.clone_from(&first.heading);
+                    println!(
+                        "dev: unit '{}' (pages {}–{} of {page_count})",
+                        first.heading, first.start_page, first.end_page
+                    );
+                    text
+                }
+                Err(_) => fallback_unit(&source, path, start_page, page_count)?,
+            }
+        }
+        Err(_) => fallback_unit(&source, path, start_page, page_count)?,
+    };
+    let pdf_name = path
+        .file_name()
+        .map_or_else(|| pdf_path.to_string(), |s| s.to_string_lossy().into_owned());
+    Ok(FirstUnit {
+        unit,
+        pdf_hash,
+        pdf_name,
+    })
+}
+
+/// `cadence dev mcq`: isolated MCQ stage against a fixture PDF (§2.1, §7.1).
+/// Extracts the first unit's text via `MuPdfSource`, generates 8 questions
+/// through `complete_cached` (cache → durable job → retry with MCQ
+/// validation), persists them with `save_mcq_items`, then runs the interactive
+/// A–E loop with immediate feedback. Defaults to an in-memory store;
+/// `--persist --seed S` writes to `.scratch/dev-mcq/` and resumes answered
+/// items on rerun. `--print-only` generates/caches without interacting.
+/// Never touches `~/.cadence/`.
+#[allow(clippy::too_many_lines)]
+fn run_dev_mcq(
+    pdf_path: &str,
+    phase_label: &str,
+    start_page: i64,
+    seed: Option<u64>,
+    persist: bool,
+    print_only: bool,
+    generation: Option<&str>,
+) -> Result<()> {
+    use std::path::Path;
+    let phase = mcq::McqPhase::parse(phase_label)?;
+    let first = extract_first_unit(pdf_path, start_page)?;
+    let unit = first.unit;
+    let pdf_hash = first.pdf_hash.clone();
+    let pdf_name = first.pdf_name;
+    let count = dev_mcq::DEV_MCQ_COUNT;
+    let prompt = match phase {
+        mcq::McqPhase::Pretest => mcq::build_pretest_prompt(&unit, count),
+        mcq::McqPhase::Retest => mcq::build_retest_prompt(&unit, count),
+        mcq::McqPhase::Review => {
+            return Err(Error::InvalidInput(
+                "dev mcq supports pretest|retest (review sets need stored misconceptions — use `cadence review`)".to_string(),
+            ));
+        }
+    };
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = dev_mcq::DEV_MCQ_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &mcq::mcq_response_schema(),
+        "mcq_set",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params =
+        mcq::mcq_params_json_with_generation(count, phase, generation);
+    let source_hash = mcq::source_hash_for(&unit.text);
+    // Store: in-memory default; `--persist` isolates to `.scratch/dev-mcq/`
+    // keyed by seed so reruns resume (never production storage).
+    let seed_tag = seed.unwrap_or(0);
+    let mut mem = MemoryStore::new();
+    let mut disk: Option<SqliteStore> = None;
+    if persist {
+        let dir = Path::new(".scratch/dev-mcq");
+        let db_path = dir.join(format!("dev-mcq-{seed_tag}.db"));
+        let lock_path = dir.join(format!("dev-mcq-{seed_tag}.lock"));
+        disk = Some(SqliteStore::open(&db_path, &lock_path)?);
+        println!("dev mcq: persisting to {}", db_path.display());
+    }
+    let store: &mut dyn Store = match disk.as_mut() {
+        Some(db) => db,
+        None => &mut mem,
+    };
+    // Show which file is being processed (avoids confusion with fixtures).
+    println!("dev mcq: pdf={pdf_name} phase={} start_page={start_page}", phase.as_str());
+    let chapter = dev_mcq::ensure_dev_chapter(store, &pdf_hash, &pdf_name, &unit)?;
+    let mut items = store.list_mcq_items(chapter.id, phase.as_str(), dev_mcq::DEV_ATTEMPT_NO)?;
+    if generation.is_some() && !items.is_empty() {
+        // A named generation is a fresh experiment: it replaces the stored set
+        // (LLM cache identity alone cannot do this — stored rows shadow it).
+        let dropped = store.delete_mcq_items_for(chapter.id, phase.as_str(), dev_mcq::DEV_ATTEMPT_NO)?;
+        println!(
+            "dev mcq: discarded {dropped} stored question(s) for fresh generation '{}'",
+            generation.unwrap_or_default()
+        );
+        items = Vec::new();
+    }
+    if items.is_empty() {
+        let today = today_date().format("%Y-%m-%d").to_string();
+        let hooks = llm::RunHooks {
+            sleep: &std::thread::sleep,
+            now_iso: today.as_str(),
+        };
+        let operation = phase.as_str().to_string();
+        let request = llm::CachedRequest {
+            operation: operation.as_str(),
+            prompt: prompt.as_str(),
+            source_hash: source_hash.as_str(),
+            params_json: params.as_str(),
+        };
+        let unit_ref = &unit;
+        let validate = |text: &str| {
+            mcq::validate_mcq_set(text, unit_ref).map(|_| text.trim().to_string())
+        };
+        let result =
+            llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+        println!(
+            "dev mcq: generated via LLM (cache: {}, transport sends: {})",
+            if result.cache_hit { "hit" } else { "miss" },
+            result.transport_calls
+        );
+        let validated = mcq::validate_mcq_set(&result.text, &unit)?;
+        let new_rows = dev_mcq::to_new_items(chapter.id, phase, &validated)?;
+        items = store.save_mcq_items(&new_rows)?;
+    } else {
+        println!(
+            "dev mcq: resumed {} cached question(s) for {} (new --seed, or --generation <name> to replace them)",
+            items.len(),
+            phase.as_str()
+        );
+    }
+    if print_only {
+        print_mcq_set(&items, &unit)?;
+        return Ok(());
+    }
+    run_mcq_session(store, &items, &unit, phase, chapter.id, dev_mcq::DEV_ATTEMPT_NO, seed)
+        .map(|_| ())
+}
+
+/// Fallback unit when the PDF has no usable outline: up to 50 pages from
+/// `start_page`.
+fn fallback_unit(
+    source: &pdf::MuPdfSource,
+    path: &std::path::Path,
+    start_page: i64,
+    page_count: i64,
+) -> Result<engines::UnitText> {
+    let end = start_page.saturating_add(49).min(page_count);
+    let mut unit = source.text_for_range(start_page, end)?;
+    unit.heading = ingest::default_title(path);
+    println!("dev mcq: no outline — using pages {start_page}–{end} of {page_count} as one unit");
+    Ok(unit)
+}
+
+/// Print a generated set without interacting (`--print-only`).
+fn print_mcq_set(items: &[store::McqItem], unit: &engines::UnitText) -> Result<()> {
+    println!("MCQ set: {} question(s)", items.len());
+    for (position, item) in items.iter().enumerate() {
+        let Some(number) = position.checked_add(1) else {
+            continue;
+        };
+        let row = dev_mcq::validated_from_row(
+            &item.question_text,
+            &item.options_json,
+            item.correct_index,
+            item.trap_index,
+            &item.explanation_text,
+            &item.topic,
+            &item.source_refs,
+            unit,
+        )?;
+        let shown = mcq::apply_shuffle(&row, dev_mcq::shuffle_seed_for(0, position))
+            .ok_or_else(|| Error::Store("stored MCQ failed shuffle".to_string()))?;
+        println!("\n{}", question_header(number, items.len(), colors_enabled()));
+        println!("{}", row.question);
+        for (index, option) in shown.displayed_options.iter().enumerate() {
+            println!("   {}) {option}", dev_mcq::option_label(index));
+        }
+        println!("   {}) {}", dev_mcq::option_label(mcq::IDK_INDEX), dev_mcq::idk_label());
+    }
+    Ok(())
+}
+
+/// Outcome of one interactive MCQ session: totals for the §15 checkpoint
+/// footer plus whether every item now has a recorded answer.
+struct SessionSummary {
+    /// Items answered in this invocation (including previously resumed).
+    answered: usize,
+    /// Items answered correctly (best recorded response per item).
+    correct: usize,
+    /// Misconceptions logged during this invocation.
+    misconceptions: usize,
+    /// True when every item has a recorded answer (no early exit).
+    completed: bool,
+}
+
+/// Divider in the `nvim` buffer (§7.2): the question above, the answer below.
+const ANSWER_DIVIDER: &str = "--- write your answer below this line ---";
+
+/// `cadence dev assignment`: isolated written-assignment stage against a
+/// fixture PDF (§2.1, §7.2). Resolves the first unit, generates 3–5 written
+/// questions plus one coding question through `complete_cached` (frozen
+/// creation-time rubrics), persists them with `save_assignment_questions`,
+/// then collects closed-book answers in `nvim` below a divider line.
+/// Defaults to an in-memory store; `--persist --seed S` writes to
+/// `.scratch/dev-assignment/` and resumes unanswered questions on rerun.
+/// `--print-only` generates without opening the editor. Never touches
+/// `~/.cadence/`.
+#[allow(clippy::too_many_lines)]
+fn run_dev_assignment(
+    pdf_path: &str,
+    start_page: i64,
+    seed: Option<u64>,
+    persist: bool,
+    print_only: bool,
+) -> Result<()> {
+    use std::path::Path;
+    let first = extract_first_unit(pdf_path, start_page)?;
+    let unit = first.unit;
+    // Store: in-memory default; `--persist` isolates to
+    // `.scratch/dev-assignment/` keyed by seed (never production storage).
+    let seed_tag = seed.unwrap_or(0);
+    let mut mem = MemoryStore::new();
+    let mut disk: Option<SqliteStore> = None;
+    if persist {
+        let dir = Path::new(".scratch/dev-assignment");
+        let db_path = dir.join(format!("dev-assignment-{seed_tag}.db"));
+        let lock_path = dir.join(format!("dev-assignment-{seed_tag}.lock"));
+        disk = Some(SqliteStore::open(&db_path, &lock_path)?);
+        println!("dev assignment: persisting to {}", db_path.display());
+    }
+    let store: &mut dyn Store = match disk.as_mut() {
+        Some(db) => db,
+        None => &mut mem,
+    };
+    println!(
+        "dev assignment: pdf={} start_page={start_page}",
+        first.pdf_name
+    );
+    let chapter =
+        dev_mcq::ensure_dev_chapter(store, &first.pdf_hash, &first.pdf_name, &unit)?;
+    let mut items =
+        store.list_assignment_questions(chapter.id, dev_mcq::DEV_ATTEMPT_NO)?;
+    if items.is_empty() {
+        let open = open_misconceptions(store, chapter.id)?;
+        let prompt = assignment::build_assignment_prompt(&unit, &open);
+        let mut config = llm::LlmConfig::from_env()?;
+        config.max_tokens = assignment::ASSIGNMENT_MAX_TOKENS;
+        config.response_format_json = Some(llm::response_format_envelope(
+            &assignment::assignment_response_schema(),
+            "assignment_set",
+        ));
+        let provider = llm::HttpLlmProvider::new(config)?;
+        let hash = assignment::misconceptions_hash(&open);
+        let params = assignment::assignment_params_json(&hash);
+        let source_hash = mcq::source_hash_for(&unit.text);
+        let today = today_date().format("%Y-%m-%d").to_string();
+        let hooks = llm::RunHooks {
+            sleep: &std::thread::sleep,
+            now_iso: today.as_str(),
+        };
+        let operation = "assignment".to_string();
+        let request = llm::CachedRequest {
+            operation: operation.as_str(),
+            prompt: prompt.as_str(),
+            source_hash: source_hash.as_str(),
+            params_json: params.as_str(),
+        };
+        let unit_ref = &unit;
+        let open_ref = &open;
+        let validate = |text: &str| {
+            assignment::validate_assignment_set(text, unit_ref, open_ref)
+                .map(|_| text.trim().to_string())
+        };
+        let result =
+            llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+        println!(
+            "dev assignment: generated via LLM (cache: {}, transport sends: {})",
+            if result.cache_hit { "hit" } else { "miss" },
+            result.transport_calls
+        );
+        let validated = assignment::validate_assignment_set(&result.text, &unit, &open)?;
+        let new_rows =
+            assignment::to_new_questions(chapter.id, dev_mcq::DEV_ATTEMPT_NO, &validated)?;
+        items = store.save_assignment_questions(&new_rows)?;
+    } else {
+        println!(
+            "dev assignment: resumed {} cached question(s) (answer files live in the editor until saved)",
+            items.len()
+        );
+    }
+    if print_only {
+        print_assignment_set(&items);
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::InvalidInput(
+            "dev assignment needs an interactive terminal for nvim (or use --print-only)".to_string(),
+        ));
+    }
+    require_nvim()?;
+    let completed = run_assignment_answers(store, &items, dev_mcq::DEV_ATTEMPT_NO)?;
+    if completed {
+        println!("\nAssignment answers complete: {}/{}.", items.len(), items.len());
+    }
+    Ok(())
+}
+
+/// Open misconceptions for assignment re-probing (§12): active rows mapped to
+/// engine input (id + concept only; the engine never touches the store).
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn open_misconceptions(
+    store: &dyn Store,
+    chapter_id: i64,
+) -> Result<Vec<assignment::OpenMisconception>> {
+    let mut out = Vec::new();
+    for row in store.list_misconceptions(chapter_id)? {
+        if row.status == "ACTIVE" {
+            out.push(assignment::OpenMisconception {
+                id: row.id,
+                concept: row.concept_description,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Print a generated assignment without interacting (`--print-only`).
+/// Model solutions stay hidden: they are grader-internal until grading.
+fn print_assignment_set(items: &[store::AssignmentQuestion]) {
+    println!("Assignment set: {} question(s)", items.len());
+    for item in items {
+        let position = item.position.saturating_add(1);
+        let parts: Vec<String> =
+            serde_json::from_str(&item.parts_json).unwrap_or_default();
+        println!("\n{position}. [{}]", item.kind);
+        for part in &parts {
+            println!("   {part}");
+        }
+        let targets: Vec<i64> =
+            serde_json::from_str(&item.target_misconception_ids).unwrap_or_default();
+        if !targets.is_empty() {
+            println!("   (re-probes misconceptions: {targets:?})");
+        }
+    }
+}
+
+/// Split a rubric file into question text + frozen rubric. Accepts either a
+/// bare stored rubric (`criteria`, `max_score`, `model_solution` — the exact
+/// `rubric_json` shape) or a full question export (`parts` + `rubric`) so a
+/// stored assignment row can be graded by dumping its columns to JSON.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] when the file is not either shape.
+fn split_rubric_file(text: &str) -> Result<(String, grading::Rubric)> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| Error::InvalidInput(format!("rubric file is not valid JSON: {e}")))?;
+    if let Some(inner) = value.get("rubric") {
+        let rubric = grading::parse_rubric_json(&inner.to_string())?;
+        let parts: Vec<String> = value
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok((parts.join("\n"), rubric));
+    }
+    Ok((String::new(), grading::parse_rubric_json(text)?))
+}
+
+/// `cadence dev grade`: isolated rubric-grading stage (§2.1, §7.3, §10).
+/// Reads the student answer (`--answers` markdown) and the frozen rubric
+/// (`--rubric` JSON: a stored `rubric_json` or a `parts`+`rubric` question
+/// export — never a fresh rubric), grades via `complete_cached` (validated
+/// before caching), and prints the §10 verdict with per-criterion scores.
+/// Cache lives in `.scratch/dev-grade/`; never touches `~/.cadence/`.
+fn run_dev_grade(answers_path: &str, rubric_path: &str) -> Result<()> {
+    let answer = std::fs::read_to_string(answers_path)?;
+    let rubric_text = std::fs::read_to_string(rubric_path)?;
+    let (question, rubric) = split_rubric_file(&rubric_text)?;
+    let prompt = grading::build_grading_prompt(&question, &rubric, &answer);
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = grading::GRADING_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &grading::grade_response_schema(&rubric),
+        "grade",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params = grading::grade_params_json_for(&rubric);
+    let source_hash = grading::grade_source_hash(&question, &rubric_text, &answer);
+    let db_path = std::path::PathBuf::from(".scratch/dev-grade/cadence.db");
+    let lock_path = std::path::PathBuf::from(".scratch/dev-grade/cadence.lock");
+    let mut store = SqliteStore::open(&db_path, &lock_path)?;
+    println!("dev grade: answers={answers_path} rubric={rubric_path}");
+    let today = today_date().format("%Y-%m-%d").to_string();
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today.as_str(),
+    };
+    let operation = "grade".to_string();
+    let request = llm::CachedRequest {
+        operation: operation.as_str(),
+        prompt: prompt.as_str(),
+        source_hash: source_hash.as_str(),
+        params_json: params.as_str(),
+    };
+    let rubric_ref = &rubric;
+    let validate = |text: &str| {
+        grading::validate_grade(text, rubric_ref).map(|_| text.trim().to_string())
+    };
+    let result = llm::complete_cached(&provider, &mut store, &request, &validate, &hooks)?;
+    println!(
+        "dev grade: graded via LLM (cache: {}, transport sends: {})",
+        if result.cache_hit { "hit" } else { "miss" },
+        result.transport_calls
+    );
+    let grade = grading::validate_grade(&result.text, &rubric)?;
+    println!(
+        "\nVerdict: {} — score {}/{}",
+        grade.classification.as_str(),
+        grade.score,
+        rubric.max_score
+    );
+    for criterion in &grade.criteria_results {
+        println!(
+            "  {}: {}/{} — {}",
+            criterion.name, criterion.score, criterion.max_score, criterion.comment
+        );
+    }
+    println!("Feedback: {}", grade.feedback);
+    if grade.classification == grading::GradeClass::QuestionDefective {
+        println!("(QUESTION_DEFECTIVE never penalizes the user: full credit, item flagged for replacement.)");
+    }
+    Ok(())
+}
+
+/// `cadence dev notes`: isolated notes-synthesis stage against a fixture PDF
+/// (§2.1, §11). Resolves the first unit, feeds optional `--misconceptions`
+/// JSON plus the chapter text through `complete_cached` (validated before
+/// caching), persists the document with `save_note`, and prints it. The
+/// isolated run has no graded answers, so the mistake/demonstrated sections
+/// say so briefly. In-memory store; never touches `~/.cadence/`.
+fn run_dev_notes(pdf_path: &str, misconceptions_path: Option<&str>) -> Result<()> {
+    let first = extract_first_unit(pdf_path, 1)?;
+    let unit = first.unit;
+    let mut store = MemoryStore::new();
+    let store_ref: &mut dyn Store = &mut store;
+    println!(
+        "dev notes: pdf={} start_page=1",
+        first.pdf_name
+    );
+    let chapter =
+        dev_mcq::ensure_dev_chapter(store_ref, &first.pdf_hash, &first.pdf_name, &unit)?;
+    let misconceptions: Vec<notes::MisconceptionItem> = match misconceptions_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            notes::parse_misconceptions_file(&text)?
+        }
+        None => Vec::new(),
+    };
+    let grades: Vec<notes::GradeSummary> = Vec::new();
+    let existing = store_ref.list_notes(chapter.id, dev_mcq::DEV_ATTEMPT_NO)?;
+    let note = if let Some(first) = existing.into_iter().next() {
+        println!("dev notes: resumed stored notes ({} chars)", first.content_markdown.chars().count());
+        first
+    } else {
+        let prompt = notes::build_notes_prompt(&unit, &misconceptions, &grades);
+        let mut config = llm::LlmConfig::from_env()?;
+        config.max_tokens = notes::NOTES_MAX_TOKENS;
+        config.response_format_json = Some(llm::response_format_envelope(
+            &notes::notes_response_schema(),
+            "notes",
+        ));
+        let provider = llm::HttpLlmProvider::new(config)?;
+        let params = notes::notes_params_json();
+        let source_hash = notes::notes_source_hash_for(&unit.text, &misconceptions, &grades);
+        let today = today_date().format("%Y-%m-%d").to_string();
+        let hooks = llm::RunHooks {
+            sleep: &std::thread::sleep,
+            now_iso: today.as_str(),
+        };
+        let operation = "notes".to_string();
+        let request = llm::CachedRequest {
+            operation: operation.as_str(),
+            prompt: prompt.as_str(),
+            source_hash: source_hash.as_str(),
+            params_json: params.as_str(),
+        };
+        let validate =
+            |text: &str| notes::validate_notes(text).map(|_| text.trim().to_string());
+        let result = llm::complete_cached(&provider, store_ref, &request, &validate, &hooks)?;
+        println!(
+            "dev notes: generated via LLM (cache: {}, transport sends: {})",
+            if result.cache_hit { "hit" } else { "miss" },
+            result.transport_calls
+        );
+        let validated = notes::validate_notes(&result.text)?;
+        let row = notes::to_new_note(chapter.id, dev_mcq::DEV_ATTEMPT_NO, &validated, &today);
+        store_ref.save_note(&row)?
+    };
+    println!("\n{}", note.content_markdown);
+    Ok(())
+}
+
+/// One disputed answer with everything the §9 auditor needs (step 1):
+/// chapter provenance, frozen rubric, student answer, and original grade.
+struct DisputeCase {
+    /// Owning chapter id (the `assignment_id` in `cadence dispute`).
+    chapter_id: i64,
+    /// Stored assignment question (re-probe targets for the §9 purge).
+    question: store::AssignmentQuestion,
+    /// Joined question parts.
+    question_text: String,
+    /// Stored `rubric_json` (cache identity uses the exact stored text).
+    rubric_json: String,
+    /// Parsed frozen rubric.
+    rubric: grading::Rubric,
+    /// Latest recorded answer.
+    answer: String,
+    /// Latest grade of record.
+    grade: store::Grade,
+    /// One-line grade summary embedded in the audit prompt.
+    grade_summary: String,
+    /// Chapter source excerpt when the unit file loads; otherwise `None` and
+    /// the auditor judges against the frozen rubric alone.
+    source_excerpt: Option<String>,
+}
+
+/// Load the disputed case (§9 step 1): question, latest answer, and latest
+/// grade for question `question_no` (1-based) in the chapter's current
+/// attempt. Every absence fails loudly — disputing an unanswered or ungraded
+/// question is a usage error, never a silent default.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] for unknown chapters, [`Error::InvalidInput`]
+/// for out-of-range questions and missing answers/grades.
+fn load_dispute_case(
+    store: &dyn Store,
+    chapter: &domain::Chapter,
+    question_no: usize,
+) -> Result<DisputeCase> {
+    let position = question_no.checked_sub(1).ok_or_else(|| {
+        Error::InvalidInput("question numbers start at 1".to_string())
+    })?;
+    let questions = store.list_assignment_questions(chapter.id, chapter.attempt_no)?;
+    if questions.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "chapter {} has no assignment questions on attempt {}",
+            chapter.id, chapter.attempt_no
+        )));
+    }
+    let total = questions.len();
+    let selected = questions.get(position).ok_or_else(|| {
+        Error::InvalidInput(format!("question {question_no} out of range (1-{total})"))
+    })?;
+    let responses = store.list_assignment_responses(selected.id)?;
+    let answer = responses.last().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "question {question_no} has no recorded answer yet — answer it first"
+        ))
+    })?;
+    let grades = store.list_grades_for_question(selected.id)?;
+    let grade = grades.last().cloned().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "question {question_no} has no recorded grade yet — grade it first"
+        ))
+    })?;
+    let rubric = grading::parse_rubric_json(&selected.rubric_json)?;
+    let parts: Vec<String> =
+        serde_json::from_str(&selected.parts_json).unwrap_or_default();
+    let source_excerpt = ingest::load_unit_text(std::path::Path::new(&chapter.file_path))
+        .ok()
+        .map(|unit| {
+            unit.text
+                .chars()
+                .take(dispute::SOURCE_EXCERPT_CHARS)
+                .collect::<String>()
+        });
+    Ok(DisputeCase {
+        chapter_id: chapter.id,
+        question: selected.clone(),
+        question_text: parts.join("\n"),
+        rubric_json: selected.rubric_json.clone(),
+        rubric,
+        answer: answer.answer_text.clone(),
+        grade_summary: format!(
+            "classification={} score={}/{} feedback={}",
+            grade.classification, grade.score, grade.max_score, grade.feedback
+        ),
+        grade,
+        source_excerpt,
+    })
+}
+
+/// Resolve the dispute text: `--text` wins, then piped stdin, then an
+/// interactive one-line prompt on a terminal (so the picker flow never dead
+/// ends). Blank text is always a usage error.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] when the text is blank,
+/// [`Error::Io`] when stdin cannot be read.
+fn read_dispute_text(explicit: Option<&str>) -> Result<String> {
+    if let Some(text) = explicit {
+        if text.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "dispute text must not be blank".to_string(),
+            ));
+        }
+        return Ok(text.trim().to_string());
+    }
+    if std::io::stdin().is_terminal() {
+        print!("Dispute text (one line) > ");
+        // A flush failure never blocks the read; stdin still holds the line.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+        if line.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "dispute text must not be blank".to_string(),
+            ));
+        }
+        return Ok(line.trim().to_string());
+    }
+    let mut piped = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut piped)?;
+    if piped.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "dispute text must not be blank".to_string(),
+        ));
+    }
+    Ok(piped.trim().to_string())
+}
+
+/// One graded assignment question for the dispute picker: 1-based position,
+/// kind label, and latest grade of record.
+struct DisputableQuestion {
+    /// 1-based position within the chapter's assignment set.
+    position: usize,
+    /// Stored kind label (`written` / `coding`).
+    kind: String,
+    /// Latest grade of record.
+    score: i64,
+    /// Rubric total.
+    max_score: i64,
+    /// Latest §10 verdict label.
+    classification: String,
+}
+
+/// One chapter with graded assignment questions on its current attempt.
+struct DisputableChapter {
+    /// Owning chapter.
+    chapter: domain::Chapter,
+    /// Graded questions in position order.
+    questions: Vec<DisputableQuestion>,
+}
+
+/// Chapters holding at least one graded assignment question on the current
+/// attempt, in id order — the `cadence dispute` picker source. Chapters
+/// without grades are not disputable and never listed.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn disputable_chapters(store: &dyn Store) -> Result<Vec<DisputableChapter>> {
+    let mut out = Vec::new();
+    for book in store.list_books()? {
+        for chapter in store.list_chapters(book.id)? {
+            let mut questions = Vec::new();
+            for (index, question) in store
+                .list_assignment_questions(chapter.id, chapter.attempt_no)?
+                .iter()
+                .enumerate()
+            {
+                let grades = store.list_grades_for_question(question.id)?;
+                let Some(grade) = grades.last() else {
+                    continue;
+                };
+                questions.push(DisputableQuestion {
+                    position: index.saturating_add(1),
+                    kind: question.kind.clone(),
+                    score: grade.score,
+                    max_score: grade.max_score,
+                    classification: grade.classification.clone(),
+                });
+            }
+            if !questions.is_empty() {
+                out.push(DisputableChapter { chapter, questions });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a `1`-based picker choice against `count` options.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] on blank, non-numeric, or out-of-range
+/// input (never panics on hostile stdin).
+fn parse_pick(input: &str, count: usize) -> Result<usize> {
+    let trimmed = input.trim();
+    let choice: usize = trimmed.parse().map_err(|_| {
+        Error::InvalidInput(format!("pick a number 1-{count}, got '{trimmed}'"))
+    })?;
+    if choice < 1 || choice > count {
+        return Err(Error::InvalidInput(format!(
+            "pick a number 1-{count}, got '{trimmed}'"
+        )));
+    }
+    Ok(choice)
+}
+
+/// Read one picker choice from interactive stdin.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] when stdin is not a terminal (picking
+/// needs a human) or the choice does not parse.
+fn prompt_pick(label: &str, count: usize) -> Result<usize> {
+    if std::io::stdin().is_terminal() {
+        print!("{label} [1-{count}] > ");
+        // A flush failure never blocks the read; stdin still holds the line.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    } else {
+        return Err(Error::InvalidInput(
+            "no selection given — pass explicit ids or run on a terminal".to_string(),
+        ));
+    }
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+    parse_pick(&line, count)
+}
+
+/// Resolve the dispute target: explicit ids pass through untouched; a missing
+/// chapter or question opens the interactive picker over graded assignments.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] for unknown chapters (via the picker index),
+/// [`Error::InvalidInput`] when nothing is graded yet or stdin is not
+/// interactive.
+fn resolve_dispute_target(
+    store: &dyn Store,
+    assignment_id: Option<i64>,
+    question_no: Option<usize>,
+) -> Result<(i64, usize)> {
+    let candidates = disputable_chapters(store)?;
+    if candidates.is_empty() {
+        return Err(Error::InvalidInput(
+            "no graded assignment questions yet — grade an assignment first".to_string(),
+        ));
+    }
+    let chapter_index = if let Some(id) = assignment_id {
+        candidates
+            .iter()
+            .position(|c| c.chapter.id == id)
+            .ok_or_else(|| {
+                Error::NotFound(format!("assignment (chapter) {id} has no graded questions"))
+            })?
+    } else {
+        println!("Graded assignments:");
+        for (index, candidate) in candidates.iter().enumerate() {
+            let total: i64 = candidate.questions.iter().map(|q| q.max_score).sum();
+            let earned: i64 = candidate.questions.iter().map(|q| q.score).sum();
+            println!(
+                "  {}. ch{} '{}' — {earned}/{total} across {} question(s)",
+                index.saturating_add(1),
+                candidate.chapter.id,
+                candidate.chapter.title,
+                candidate.questions.len(),
+            );
+        }
+        prompt_pick("Dispute which chapter?", candidates.len())?.saturating_sub(1)
+    };
+    let selected = candidates
+        .get(chapter_index)
+        .ok_or_else(|| Error::InvalidInput("choice out of range".to_string()))?;
+    let position = if let Some(number) = question_no {
+        if !selected.questions.iter().any(|q| q.position == number) {
+            return Err(Error::InvalidInput(format!(
+                "question {number} is not graded in chapter {} (1-{})",
+                selected.chapter.id,
+                selected.questions.len()
+            )));
+        }
+        number
+    } else {
+        println!("Graded questions in '{}':", selected.chapter.title);
+        for (index, question) in selected.questions.iter().enumerate() {
+            println!(
+                "  {}. Q{} {} — {}/{} {}",
+                index.saturating_add(1),
+                question.position,
+                question.kind,
+                question.score,
+                question.max_score,
+                question.classification,
+            );
+        }
+        let choice = prompt_pick("Dispute which question?", selected.questions.len())?;
+        selected
+            .questions
+            .get(choice.saturating_sub(1))
+            .map(|q| q.position)
+            .ok_or_else(|| Error::InvalidInput("choice out of range".to_string()))?
+    };
+    Ok((selected.chapter.id, position))
+}
+
+/// Purge misconceptions invalidated by a successful dispute (§9 step 3): the
+/// `ASSIGNMENT` row the bad grade logged plus the re-probed targets it
+/// nudged down are marked `DISPUTED` with confidence preserved (see
+/// [`dispute::select_dispute_purge_ids`] for the exact set). `UPHELD` purges
+/// nothing. Corrupt `target_misconception_ids` are reported and skipped on
+/// the target side — the logged-row side still purges. Returns rows updated.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn apply_dispute_purge(
+    store: &mut dyn Store,
+    question: &store::AssignmentQuestion,
+    action: dispute::DisputeAction,
+    today: &str,
+) -> Result<usize> {
+    if !dispute::should_purge_misconceptions(action) {
+        return Ok(0);
+    }
+    if serde_json::from_str::<Vec<i64>>(&question.target_misconception_ids).is_err() {
+        println!(
+            "Question {} has corrupt re-probe targets — purging only its logged assignment row.",
+            question.position.saturating_add(1)
+        );
+    }
+    let rows = store.list_misconceptions(question.chapter_id)?;
+    let ids = dispute::select_dispute_purge_ids(
+        &question.target_misconception_ids,
+        question.position,
+        &rows,
+    );
+    let mut purged = 0_usize;
+    for row in &rows {
+        if !ids.contains(&row.id) {
+            continue;
+        }
+        store.update_misconception(
+            row.id,
+            row.confidence,
+            "DISPUTED",
+            today,
+            row.resolved_at.as_deref(),
+        )?;
+        purged = purged.saturating_add(1);
+        println!("Misconception purged (disputed): {}", row.concept_description);
+    }
+    Ok(purged)
+}
+
+/// `cadence dispute <assignment_id> --question <N>` (§9): fresh independent
+/// audit of one graded answer, grade correction in SQLite with the original
+/// preserved, an inspectable `disputes` trail row, and the §9 step-3 purge —
+/// on `REVISED`/`QUESTION_DEFECTIVE` the `ASSIGNMENT` row the bad grade
+/// logged and the re-probed targets it nudged down are marked `DISPUTED`.
+///
+/// `assignment_id` is the chapter whose assignment set holds the question;
+/// `N` is the 1-based position within that set.
+///
+/// # Errors
+///
+/// Propagates lookup failures from [`load_dispute_case`], LLM failures from
+/// `complete_cached`, and persistence failures from the store.
+fn run_dispute(
+    store: &mut SqliteStore,
+    assignment_id: i64,
+    question_no: usize,
+    text: Option<&str>,
+) -> Result<()> {
+    let chapter = store.get_chapter(assignment_id).map_err(|_| {
+        Error::NotFound(format!("assignment (chapter) {assignment_id}"))
+    })?;
+    let case = load_dispute_case(store, &chapter, question_no)?;
+    let dispute_text = read_dispute_text(text)?;
+    let prompt = dispute::build_dispute_prompt(
+        case.question_text.as_str(),
+        &case.rubric,
+        case.answer.as_str(),
+        case.grade_summary.as_str(),
+        dispute_text.as_str(),
+        case.source_excerpt.as_deref(),
+    );
+    let mut config = llm::LlmConfig::from_env()?;
+    config.max_tokens = dispute::DISPUTE_MAX_TOKENS;
+    config.response_format_json = Some(llm::response_format_envelope(
+        &dispute::dispute_response_schema(case.rubric.max_score),
+        "dispute",
+    ));
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params = dispute::dispute_params_json_for(case.rubric.max_score);
+    let source_hash = dispute::dispute_source_hash(
+        case.question_text.as_str(),
+        case.rubric_json.as_str(),
+        case.answer.as_str(),
+        case.grade_summary.as_str(),
+        dispute_text.as_str(),
+    );
+    let today = today_date().format("%Y-%m-%d").to_string();
+    let hooks = llm::RunHooks {
+        sleep: &std::thread::sleep,
+        now_iso: today.as_str(),
+    };
+    let operation = "dispute".to_string();
+    let request = llm::CachedRequest {
+        operation: operation.as_str(),
+        prompt: prompt.as_str(),
+        source_hash: source_hash.as_str(),
+        params_json: params.as_str(),
+    };
+    let max_score = case.rubric.max_score;
+    let original_score = case.grade.score;
+    let validate = |text: &str| {
+        dispute::validate_dispute(text, max_score, original_score)
+            .map(|_| text.trim().to_string())
+    };
+    println!(
+        "dispute: auditing assignment {} question {question_no} (grade {}: {} {}/{})",
+        case.chapter_id,
+        case.grade.id,
+        case.grade.classification,
+        case.grade.score,
+        case.grade.max_score,
+    );
+    let result = llm::complete_cached(&provider, store, &request, &validate, &hooks)?;
+    println!(
+        "dispute: audited via LLM (cache: {}, transport sends: {})",
+        if result.cache_hit { "hit" } else { "miss" },
+        result.transport_calls
+    );
+    let audit = dispute::validate_dispute(&result.text, max_score, original_score)?;
+    let trail = store.record_dispute(&store::NewDispute {
+        grade_id: case.grade.id,
+        text: dispute_text,
+        decision: audit.action.as_str().to_string(),
+        final_score: audit.final_score,
+        adjudication_json: result.text,
+        adjudicator_model: llm::RawTransport::model_id(&provider).to_string(),
+        timestamp: today.clone(),
+    })?;
+    let purged = apply_dispute_purge(store, &case.question, audit.action, &today)?;
+    if purged > 0 {
+        println!("Misconceptions purged: {purged} row(s) marked DISPUTED (bad-grade evidence withdrawn).");
+    }
+    println!(
+        "\nVerdict: {} — final {}/{} (was {}/{})",
+        audit.action.as_str(),
+        audit.final_score,
+        max_score,
+        original_score,
+        max_score,
+    );
+    println!("Explanation: {}", audit.explanation);
+    if audit.dispute_valid {
+        println!(
+            "Grade corrected in SQLite (dispute row {}; original {} preserved).",
+            trail.id, original_score
+        );
+    } else {
+        println!("Original grade stands (dispute row {} recorded).", trail.id);
+    }
+    if audit.action == dispute::DisputeAction::QuestionDefective {
+        println!("(QUESTION_DEFECTIVE never penalizes the user: full credit, item flagged for replacement.)");
+    }
+    Ok(())
+}
+
+/// Collect closed-book answers in `nvim` (§7.2): one editor buffer per
+/// unanswered question, answer below the divider, `:wq` saves and advances.
+/// Blank answers prompt once (`intentional?`); `:q!` without writing leaves
+/// the question pending. Returns whether every question is answered.
+fn run_assignment_answers(
+    store: &mut dyn Store,
+    items: &[store::AssignmentQuestion],
+    attempt_no: i64,
+) -> Result<bool> {
+    let today = today_date().format("%Y-%m-%d").to_string();
+    let total = items.len();
+    for item in items {
+        if !store.list_assignment_responses(item.id)?.is_empty() {
+            continue;
+        }
+        let position = item.position.saturating_add(1);
+        let parts: Vec<String> =
+            serde_json::from_str(&item.parts_json).unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!("cadence-assignment-{}.md", item.id));
+        // Keep an existing draft (crash recovery); otherwise write the
+        // template. The file lives until the answer is persisted (§16).
+        if !tmp.exists() {
+            let mut template = format!("# Question {position}/{total} [{}]\n\n", item.kind);
+            for part in &parts {
+                template.push_str(part);
+                template.push('\n');
+            }
+            template.push('\n');
+            template.push_str(ANSWER_DIVIDER);
+            template.push('\n');
+            std::fs::write(&tmp, template)?;
+        }
+        let answered = loop {
+            println!("\nQuestion {position}/{total} [{}] — opening nvim (:wq saves, :q! skips).", item.kind);
+            let status = Command::new("nvim").arg(&tmp).status()?;
+            if !status.success() {
+                println!("Editor exited without saving — question left pending.");
+                break false;
+            }
+            let buffer = std::fs::read_to_string(&tmp)?;
+            let Some(answer) = buffer.split_once(ANSWER_DIVIDER).map(|(_, after)| after.trim().to_string()) else {
+                println!("Divider deleted — reopening so the answer lands below it.");
+                continue;
+            };
+            if answer.is_empty() {
+                match ask_terminal("You left this blank — intentional? [y/n] > ")? {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => {
+                        println!("\nSession saved — rerun to resume.");
+                        break false;
+                    }
+                }
+            }
+            store.record_assignment_response(item.id, &answer, &today, attempt_no)?;
+            let _ = std::fs::remove_file(&tmp);
+            println!("Answer saved ({} chars).", answer.chars().count());
+            break true;
+        };
+        if !answered {
+            let mut done = 0_usize;
+            for other in items {
+                if !store.list_assignment_responses(other.id)?.is_empty() {
+                    done = done.saturating_add(1);
+                }
+            }
+            println!("Session saved — rerun to resume (answered {done}/{total}).");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Interactive A–E loop with immediate feedback, trap labels, misconception
+/// logging (retest only), and resume (answered items are skipped). `Ctrl-C` /
+/// `Ctrl-D` (EOF) exits cleanly with persistence; rerun resumes.
+fn run_mcq_session(
+    store: &mut dyn Store,
+    items: &[store::McqItem],
+    unit: &engines::UnitText,
+    phase: mcq::McqPhase,
+    chapter_id: i64,
+    attempt_no: i64,
+    seed: Option<u64>,
+) -> Result<SessionSummary> {
+    let base_seed = seed.unwrap_or_else(mcq::random_seed);
+    let today = today_date().format("%Y-%m-%d").to_string();
+    let mut correct_total = 0_usize;
+    let mut answered_total = 0_usize;
+    let mut misconceptions = 0_usize;
+    for (position, item) in items.iter().enumerate() {
+        let Some(number) = position.checked_add(1) else {
+            continue;
+        };
+        if dev_mcq::is_answered(store, item.id)? {
+            let prior = store.list_mcq_responses(item.id)?;
+            if prior.iter().any(|r| r.is_correct) {
+                correct_total = correct_total.saturating_add(1);
+            }
+            answered_total = answered_total.saturating_add(1);
+            continue;
+        }
+        let row = dev_mcq::validated_from_row(
+            &item.question_text,
+            &item.options_json,
+            item.correct_index,
+            item.trap_index,
+            &item.explanation_text,
+            &item.topic,
+            &item.source_refs,
+            unit,
+        )?;
+        let shown = mcq::apply_shuffle(&row, dev_mcq::shuffle_seed_for(base_seed, position))
+            .ok_or_else(|| Error::Store("stored MCQ failed shuffle".to_string()))?;
+        let Some(selected) = ask_answer(number, items.len(), &row, &shown)? else {
+            println!(
+                "\nSession saved — rerun to resume (answered {answered_total}/{}).",
+                items.len()
+            );
+            print_mcq_score(correct_total, answered_total, misconceptions);
+            return Ok(SessionSummary {
+                answered: answered_total,
+                correct: correct_total,
+                misconceptions,
+                completed: false,
+            });
+        };
+        let outcome = record_answer(
+            store,
+            item.id,
+            chapter_id,
+            phase,
+            &row,
+            &shown,
+            selected,
+            attempt_no,
+            &today,
+        )?;
+        answered_total = answered_total.saturating_add(1);
+        if outcome.is_correct {
+            correct_total = correct_total.saturating_add(1);
+        }
+        if outcome.misconception_logged {
+            misconceptions = misconceptions.saturating_add(1);
+        }
+    }
+    println!("\nSession complete: {correct_total}/{} correct.", items.len());
+    print_mcq_score(correct_total, answered_total, misconceptions);
+    Ok(SessionSummary {
+        answered: answered_total,
+        correct: correct_total,
+        misconceptions,
+        completed: true,
+    })
+}
+
+/// Display one question and read the answer. Returns `None` on EOF (clean
+/// exit; state already persisted up to the previous question).
+///
+/// The topic stays hidden until after answering: it often names the concept
+/// under test and would give away the solution.
+fn ask_answer(
+    number: usize,
+    total: usize,
+    row: &mcq::ValidatedMcq,
+    shown: &mcq::DisplayedMcq,
+) -> Result<Option<usize>> {
+    use std::io::Write as _;
+    println!("\n{}", question_header(number, total, colors_enabled()));
+    println!("{}", row.question);
+    for (index, option) in shown.displayed_options.iter().enumerate() {
+        println!("   {}) {option}", dev_mcq::option_label(index));
+    }
+    println!(
+        "   {}) {}",
+        dev_mcq::option_label(mcq::IDK_INDEX),
+        dev_mcq::idk_label()
+    );
+    loop {
+        print!("Your answer [A/B/C/D/E] > ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let bytes = std::io::stdin().read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if let Some(index) = dev_mcq::parse_answer(&line) {
+            return Ok(Some(index));
+        }
+        println!("Please answer A, B, C, D, or E.");
+    }
+}
+
+/// Outcome of grading one answer (feedback already printed).
+struct AnswerOutcome {
+    /// Whether the selection was correct.
+    is_correct: bool,
+    /// Whether a misconception row was logged (retest wrong non-E only).
+    misconception_logged: bool,
+}
+
+/// ANSI color codes for verdict feedback: green for correct, red for its
+/// counterpart.
+const GREEN_CODE: &str = "\x1b[32m";
+const RED_CODE: &str = "\x1b[31m";
+const RESET_CODE: &str = "\x1b[0m";
+/// Bold for question headers (same `NO_COLOR` gating as verdict colors).
+const BOLD_CODE: &str = "\x1b[1m";
+
+/// Wrap `text` in an ANSI color code unless `enabled` is false (plain text
+/// for tests and `NO_COLOR` environments).
+fn paint(text: &str, code: &str, enabled: bool) -> String {
+    if enabled {
+        format!("{code}{text}{RESET_CODE}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Whether verdict colors apply: suppressed only under `NO_COLOR`.
+fn colors_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+/// High-visibility question header: the counter gets its own ruled line so
+/// `Question 3/8` scans even between long explanations. Pure for tests;
+/// callers pass [`colors_enabled`].
+#[must_use]
+fn question_header(number: usize, total: usize, enabled: bool) -> String {
+    paint(
+        &format!("─── Question {number}/{total} ───"),
+        BOLD_CODE,
+        enabled,
+    )
+}
+
+/// Boost confidence on open misconception rows matching a correct answer's
+/// topic (§12: correct retest increases it). Only `ACTIVE`/`IMPROVING` rows
+/// move — resolved rows never reopen here, and disputed rows belong to the
+/// §9 purge. Returns rows updated.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn boost_matching_misconceptions(
+    store: &mut dyn Store,
+    chapter_id: i64,
+    topic: &str,
+    today: &str,
+) -> Result<usize> {
+    let mut boosted = 0_usize;
+    for row in store.list_misconceptions(chapter_id)? {
+        if row.concept_description != topic {
+            continue;
+        }
+        if row.status != "ACTIVE" && row.status != "IMPROVING" {
+            continue;
+        }
+        let step = misconceptions::apply_outcome(row.confidence, &row.status, true, false);
+        let resolved_at = if step.just_resolved {
+            Some(today)
+        } else {
+            row.resolved_at.as_deref()
+        };
+        store.update_misconception(row.id, step.confidence, step.status, today, resolved_at)?;
+        boosted = boosted.saturating_add(1);
+        if step.just_resolved {
+            println!("Misconception resolved: {}", row.concept_description);
+        } else {
+            println!(
+                "Misconception improving: {} (confidence {:.2} → {:.2})",
+                row.concept_description, row.confidence, step.confidence
+            );
+        }
+    }
+    Ok(boosted)
+}
+
+/// Nudge confidence down on open misconception rows matching a wrong review
+/// answer's topic (§12: wrong retest evidence decreases it). Only
+/// `ACTIVE`/`IMPROVING` rows move — resolved rows never reopen here, and
+/// disputed rows belong to the §9 purge. `resolved_at` is always preserved:
+/// a downward step never resolves, so any `RESOLVED` outcome here would mean
+/// a corrupt status/confidence pair and must not mint a resolution stamp.
+/// Returns rows updated.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn nudge_matching_misconceptions(
+    store: &mut dyn Store,
+    chapter_id: i64,
+    topic: &str,
+    today: &str,
+) -> Result<usize> {
+    let mut nudged = 0_usize;
+    for row in store.list_misconceptions(chapter_id)? {
+        if row.concept_description != topic {
+            continue;
+        }
+        if row.status != "ACTIVE" && row.status != "IMPROVING" {
+            continue;
+        }
+        let step = misconceptions::apply_outcome(row.confidence, &row.status, false, false);
+        store.update_misconception(
+            row.id,
+            step.confidence,
+            step.status,
+            today,
+            row.resolved_at.as_deref(),
+        )?;
+        nudged = nudged.saturating_add(1);
+        println!(
+            "Misconception persists: {} (confidence {:.2} → {:.2})",
+            row.concept_description, row.confidence, step.confidence
+        );
+    }
+    Ok(nudged)
+}
+
+/// Record one answer, print immediate feedback, and log a misconception when
+/// [`mcq::should_log_misconception`] applies.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from the backend.
+fn record_answer(
+    store: &mut dyn Store,
+    item_id: i64,
+    chapter_id: i64,
+    phase: mcq::McqPhase,
+    row: &mcq::ValidatedMcq,
+    shown: &mcq::DisplayedMcq,
+    selected: usize,
+    attempt_no: i64,
+    today: &str,
+) -> Result<AnswerOutcome> {
+    let is_correct = selected == shown.displayed_correct;
+    let selected_trap = selected == shown.displayed_trap;
+    store.record_mcq_response(
+        item_id,
+        i64::try_from(selected).unwrap_or(4),
+        is_correct,
+        selected_trap,
+        today,
+        attempt_no,
+    )?;
+    if is_correct {
+        println!("{}", paint("Correct.", GREEN_CODE, colors_enabled()));
+        println!("[{}] {}", row.topic, row.explanation);
+        if matches!(phase, mcq::McqPhase::Retest | mcq::McqPhase::Review) {
+            boost_matching_misconceptions(store, chapter_id, &row.topic, today)?;
+        }
+        return Ok(AnswerOutcome {
+            is_correct,
+            misconception_logged: false,
+        });
+    }
+    let selected_text = if selected == mcq::IDK_INDEX {
+        dev_mcq::idk_label().to_string()
+    } else {
+        shown
+            .displayed_options
+            .get(selected)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let correct_text = shown
+        .displayed_options
+        .get(shown.displayed_correct)
+        .cloned()
+        .unwrap_or_default();
+    println!(
+        "{}",
+        paint(
+            &format!(
+                "Incorrect — correct answer: {}) {correct_text}",
+                dev_mcq::option_label(shown.displayed_correct)
+            ),
+            RED_CODE,
+            colors_enabled()
+        )
+    );
+    println!("[{}] {}", row.topic, row.explanation);
+    if selected_trap {
+        println!("TRAP DETECTED: {} — {selected_text}", row.topic);
+    }
+    let mut logged = false;
+    if phase == mcq::McqPhase::Review {
+        // Review re-probes an existing row: a wrong answer nudges the
+        // topic-matched open rows down (−0.1) instead of logging a duplicate.
+        // `"I don't know"` abstains (no signal). When no open row matches —
+        // it resolved between generation and answering — the wrong answer is
+        // still evidence, so it logs a fresh row like a retest would.
+        if selected != mcq::IDK_INDEX {
+            let moved = nudge_matching_misconceptions(store, chapter_id, &row.topic, today)?;
+            if moved > 0 {
+                logged = true;
+            } else {
+                let (concept, description, evidence) = dev_mcq::misconception_texts(
+                    &row.topic,
+                    &row.question,
+                    &selected_text,
+                    &correct_text,
+                    selected_trap,
+                );
+                store.create_misconception(
+                    chapter_id,
+                    &concept,
+                    &description,
+                    &evidence,
+                    "RETEST",
+                    today,
+                )?;
+                logged = true;
+                println!("Misconception logged: {concept}");
+            }
+        }
+    } else if mcq::should_log_misconception(phase, is_correct, selected) {
+        let (concept, description, evidence) =
+            dev_mcq::misconception_texts(&row.topic, &row.question, &selected_text, &correct_text, selected_trap);
+        store.create_misconception(chapter_id, &concept, &description, &evidence, "RETEST", today)?;
+        logged = true;
+        println!("Misconception logged: {concept}");
+    }
+    Ok(AnswerOutcome {
+        is_correct,
+        misconception_logged: logged,
+    })
+}
+
+/// Score footer shared by clean-EOF exits and full completions.
+fn print_mcq_score(correct: usize, answered: usize, misconceptions: usize) {
+    println!("Answered: {answered}. Misconception updates this session: {misconceptions}.");
+    let _ = correct;
+}
+/// Fixture shape: `{"today": "YYYY-MM-DD", "tasks": [{...}]}` where each task
+/// has `task_type`, `scheduled_for`, `status`, `sequence`, `chapter_id`.
+fn run_dev_schedule(fixture_path: &str) -> Result<()> {
+    let text = std::fs::read_to_string(fixture_path)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| Error::InvalidInput(e.to_string()))?;
+    let today_text = parsed
+        .get("today")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::InvalidInput("fixture needs 'today': 'YYYY-MM-DD'".to_string()))?;
+    let today = parse_date(today_text)?;
+    let raw_tasks = parsed
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::InvalidInput("fixture needs 'tasks': [...]".to_string()))?;
+    let mut tasks = Vec::with_capacity(raw_tasks.len());
+    for (index, item) in raw_tasks.iter().enumerate() {
+        let kind = item
+            .get("task_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("task {index}: missing 'task_type'"))
+            })?;
+        let scheduled = item
+            .get("scheduled_for")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("task {index}: missing 'scheduled_for'"))
+            })?;
+        let status_text = item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("PENDING");
+        let chapter_id = item
+            .get("chapter_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(1);
+        let sequence = item
+            .get("sequence")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|s| usize::try_from(s).ok())
+            .and_then(|s| i64::try_from(s).ok().or(Some(1)))
+            .unwrap_or(1);
+        let Ok(seq) = i64::try_from(index).map(|i| i.saturating_add(1)) else {
+            continue;
+        };
+        let _ = sequence;
+        tasks.push(Task {
+            id: seq,
+            book_id: 1,
+            chapter_id,
+            task_type: TaskType::parse(kind)?,
+            scheduled_for: parse_date(scheduled)?,
+            status: TaskStatus::parse(status_text)?,
+            completed_at: None,
+            sequence: seq,
+            attempt_no: item
+                .get("attempt_no")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1),
+        });
+    }
+    let queue = today_queue(&tasks, today);
+    println!(
+        "Fixture: {} task(s), today = {today}. Executable queue: {}",
+        tasks.len(),
+        queue.len()
+    );
+    for task in &queue {
+        println!(
+            "  [{}] chapter {} scheduled {} ({})",
+            task.task_type.as_str(),
+            task.chapter_id,
+            task.scheduled_for,
+            classify_label(task, today)
+        );
+    }
+    println!(
+        "pull_available: {}",
+        if pull_available(&tasks, today) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    let window = project_window(2, today)?;
+    println!("3-day window projection (2 chapters):");
+    for (date, row) in &window {
+        println!(
+            "  {date} ch+{} d+{}: {}",
+            row.chapter_offset, row.day_offset, row.activity
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load()?;
+    let Some(command) = cli.command else {
+        // Default entrypoint: today's scheduled loop.
+        require_nvim()?;
+        let mut store = open_production_store(&config)?;
+        let today = today_date();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        return run_daily_loop(&mut store, today, &today_str);
+    };
+    match command {
+        Commands::Ingest(args) => {
+            let Some(start_page) = args.start_page else {
+                return Err(Error::InvalidInput(
+                    "--start-page is mandatory (one-based physical page)".to_string(),
+                ));
+            };
+            run_ingest(
+                &args.pdf,
+                start_page,
+                args.max_unit_pages,
+                args.title.as_deref(),
+                args.manual_boundaries.as_deref(),
+                args.chapter_level,
+                &config,
+            )
+        }
+        Commands::Today(args) => {
+            let today = args
+                .date
+                .as_deref()
+                .map_or_else(|| Ok(today_date()), parse_date)?;
+            let mut store = open_production_store(&config)?;
+            let today_str = today.format("%Y-%m-%d").to_string();
+            let _ = ensure_all_books(&mut store, today, &today_str)?;
+            let tasks = store.list_tasks()?;
+            print_queue(&store, &tasks, today);
+            Ok(())
+        }
+        Commands::Schedule(args) => {
+            if args.days < 1 {
+                return Err(Error::InvalidInput("--days must be >= 1".to_string()));
+            }
+            let mut store = open_production_store(&config)?;
+            let today = today_date();
+            let today_str = today.format("%Y-%m-%d").to_string();
+            let _ = ensure_all_books(&mut store, today, &today_str)?;
+            let tasks = store.list_tasks()?;
+            print_queue(&store, &tasks, today);
+            print_upcoming(&store, &tasks, today, args.days);
+            Ok(())
+        }
+        Commands::Pull => {
+            require_nvim()?;
+            let mut store = open_production_store(&config)?;
+            let today = today_date();
+            let today_str = today.format("%Y-%m-%d").to_string();
+            let _ = ensure_all_books(&mut store, today, &today_str)?;
+            match pull_next(&mut store, today, &today_str) {
+                Ok(Some((pulled, previous))) => {
+                    let chapter = store.get_chapter(pulled.chapter_id)?;
+                    println!(
+                        "Pulled forward: Chapter '{}' — {} (was {previous}, now due {today}).",
+                        chapter.title,
+                        pulled.task_type.as_str()
+                    );
+                    println!("Pulled work is mandatory — pull again to cascade the pipeline.");
+                    Ok(())
+                }
+                Ok(None) => {
+                    println!("Mandatory work complete — no future pretest to pull.");
+                    Ok(())
+                }
+                Err(Error::InvalidTransition(_)) => {
+                    println!(
+                        "Mandatory work remains — clear today's queue before pulling future work."
+                    );
+                    let tasks = store.list_tasks()?;
+                    print_queue(&store, &tasks, today);
+                    Ok(())
+                }
+                Err(other) => Err(other),
+            }
+        }
+        Commands::Metrics => {
+            let store = open_production_store(&config)?;
+            run_metrics(&store, today_date())
+        }
+        Commands::Skip(args) => {
+            let mut store = open_production_store(&config)?;
+            let today_str = today_date().format("%Y-%m-%d").to_string();
+            run_skip(&mut store, args.id, &today_str)
+        }
+        Commands::Unskip(args) => {
+            let mut store = open_production_store(&config)?;
+            let today = today_date();
+            let today_str = today.format("%Y-%m-%d").to_string();
+            run_unskip(&mut store, args.id, today, &today_str)
+        }
+        Commands::Misconceptions => {
+            let store = open_production_store(&config)?;
+            run_misconceptions(&store)
+        }
+        Commands::Notes(args) => {
+            let store = open_production_store(&config)?;
+            run_notes(&store, args.id)
+        }
+        Commands::Progress => {
+            let store = open_production_store(&config)?;
+            run_progress(&store)
+        }
+        Commands::Review => {
+            let mut store = open_production_store(&config)?;
+            let today_str = today_date().format("%Y-%m-%d").to_string();
+            run_review(&mut store, &today_str)
+        }
+        Commands::Dispute(args) => {
+            let mut store = open_production_store(&config)?;
+            let (chapter_id, question_no) =
+                resolve_dispute_target(&store, args.assignment_id, args.question)?;
+            run_dispute(&mut store, chapter_id, question_no, args.text.as_deref())
+        }
+        Commands::Doctor => {
+            let mut problems: u32 = 0;
+            match Config::load() {
+                Ok(cfg) => println!("config: OK ({})", cfg.db_path().display()),
+                Err(e) => {
+                    problems = problems.saturating_add(1);
+                    println!("config: FAIL ({e})");
+                }
+            }
+            match require_nvim() {
+                Ok(()) => println!("nvim: OK"),
+                Err(e) => {
+                    problems = problems.saturating_add(1);
+                    println!("nvim: FAIL ({e})");
+                }
+            }
+            match open_production_store(&config) {
+                Ok(_) => println!("db: OK (lock acquired, schema v{})", store::SCHEMA_VERSION),
+                Err(e) => {
+                    problems = problems.saturating_add(1);
+                    println!("db: FAIL ({e})");
+                }
+            }
+            println!("pdf: OK (mupdf 0.8.0, base14-fonts)");
+            match llm::LlmConfig::from_env() {
+                Err(_) => println!("llm: SKIP (no AI_GATEWAY_API_KEY, GOOGLE_API_KEY, or CADENCE_API_KEY/CADENCE_LLM_ENDPOINT configured)"),
+                Ok(cfg) => match llm::HttpLlmProvider::new(cfg.clone()).and_then(|p| p.check_api()) {
+                    Ok(()) => println!("llm: OK ({} reachable at {})", cfg.provider, cfg.endpoint),
+                    Err(e) => {
+                        problems = problems.saturating_add(1);
+                        println!("llm: FAIL ({e})");
+                    }
+                },
+            }
+            if problems == 0 {
+                println!("doctor: all checks passed");
+                Ok(())
+            } else {
+                Err(Error::Store(format!("doctor found {problems} problem(s)")))
+            }
+        }
+        Commands::Dev(dev) => match dev.stage {
+            DevStage::Schedule(args) => run_dev_schedule(&args.fixture),
+            DevStage::Ingest(args) => run_dev_ingest(
+                &args.pdf,
+                args.start_page,
+                args.max_unit_pages,
+                args.manual_boundaries.as_deref(),
+                args.chapter_level,
+                args.max_units,
+            ),
+            DevStage::Mcq(args) => run_dev_mcq(
+                &args.pdf,
+                &args.phase,
+                args.start_page,
+                args.seed,
+                args.persist,
+                args.print_only,
+                args.generation.as_deref(),
+            ),
+            DevStage::Assignment(args) => run_dev_assignment(
+                &args.pdf,
+                args.start_page,
+                args.seed,
+                args.persist,
+                args.print_only,
+            ),
+            DevStage::Grade(args) => run_dev_grade(&args.answers, &args.rubric),
+            DevStage::Notes(args) => {
+                run_dev_notes(&args.pdf, args.misconceptions.as_deref())
+            }
+            DevStage::Llm(args) => run_dev_llm(&args.operation, args.prompt.as_deref(), args.model.as_deref()),
+        },
+    }
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("cadence: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assignment_question_text_joins_parts() {
+        assert_eq!(
+            assignment_question_text(r#"["a) Explain &x.", "b) Give a counterexample."]"#),
+            "a) Explain &x.\nb) Give a counterexample."
+        );
+        // Corrupt rows degrade to rubric-only grading, never panic.
+        assert_eq!(assignment_question_text("{broken"), String::new());
+        assert_eq!(assignment_question_text("[]"), String::new());
+    }
+
+    #[test]
+    fn criteria_results_json_round_trips() {
+        let results = vec![grading::CriterionResult {
+            name: "correctness".to_string(),
+            score: 4,
+            max_score: 5,
+            comment: "Address named correctly.".to_string(),
+        }];
+        let parsed: serde_json::Value =
+            serde_json::from_str(&criteria_results_json(&results)).unwrap();
+        assert_eq!(parsed[0]["name"], serde_json::json!("correctness"));
+        assert_eq!(parsed[0]["score"], serde_json::json!(4));
+        assert_eq!(parsed[0]["max_score"], serde_json::json!(5));
+        assert!(criteria_results_json(&[]).contains("[]"));
+    }
+
+    #[test]
+    fn grade_to_new_preserves_audit_trail() {
+        let grade = grading::Grade {
+            classification: grading::GradeClass::PartiallyCorrect,
+            score: 6,
+            criteria_results: vec![grading::CriterionResult {
+                name: "correctness".to_string(),
+                score: 3,
+                max_score: 5,
+                comment: "Half right.".to_string(),
+            }],
+            feedback: "Good start on aliasing.".to_string(),
+        };
+        let row = grade_to_new(7, &grade, 8, "2026-09-25");
+        assert_eq!(row.question_id, 7);
+        assert_eq!(row.score, 6);
+        assert_eq!(row.max_score, 8);
+        assert_eq!(row.classification, "PARTIALLY_CORRECT");
+        assert_eq!(row.feedback, "Good start on aliasing.");
+        assert_eq!(row.grader_version, llm::PROMPT_VERSION);
+        assert_eq!(row.created_at, "2026-09-25");
+        assert!(row.criteria_results_json.contains("correctness"));
+    }
+
+    #[test]
+    fn misconception_items_map_all_statuses() {
+        let rows = vec![
+            store::Misconception {
+                id: 1,
+                chapter_id: 2,
+                concept_description: "aliasing".to_string(),
+                description: " fuller ".to_string(),
+                evidence: "missed it".to_string(),
+                source_task: "RETEST".to_string(),
+                status: "ACTIVE".to_string(),
+                confidence: 0.5,
+                created_at: "2026-09-25".to_string(),
+                updated_at: "2026-09-25".to_string(),
+                resolved_at: None,
+            },
+            store::Misconception {
+                id: 2,
+                chapter_id: 2,
+                concept_description: "scales".to_string(),
+                description: " fuller ".to_string(),
+                evidence: "fixed on assignment".to_string(),
+                source_task: "ASSIGNMENT".to_string(),
+                status: "RESOLVED".to_string(),
+                confidence: 0.9,
+                created_at: "2026-09-25".to_string(),
+                updated_at: "2026-09-25".to_string(),
+                resolved_at: Some("2026-09-25".to_string()),
+            },
+        ];
+        let items = misconception_items_for(&rows);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].concept, "aliasing");
+        assert_eq!(items[0].evidence, "missed it");
+        assert_eq!(items[0].status, "ACTIVE");
+        assert_eq!(items[1].status, "RESOLVED");
+        assert_eq!(misconception_items_for(&[]).len(), 0);
+    }
+
+    #[test]
+    fn assignment_misconception_texts_label_and_truncate() {
+        let (concept, description, evidence) = assignment_misconception_texts(
+            0,
+            "a) Explain what &x yields and why it matters for aliasing.",
+            "INCORRECT",
+            2,
+            8,
+            "Confused address with value.",
+            "I think &x gives the value stored at x...",
+        );
+        assert!(concept.starts_with("Assignment Q1: "), "{concept}");
+        assert!(concept.contains("&x"));
+        assert!(description.contains("INCORRECT 2/8"), "{description}");
+        assert!(description.contains("Confused address"), "{description}");
+        assert!(evidence.starts_with("Answer excerpt: "), "{evidence}");
+        // Long inputs truncate instead of bloating the row.
+        let long_question = "q".repeat(200);
+        let (long_concept, _, _) = assignment_misconception_texts(
+            3,
+            &long_question,
+            "PARTIALLY_CORRECT",
+            4,
+            8,
+            "Half right.",
+            "a",
+        );
+        assert!(long_concept.starts_with("Assignment Q4: "), "{long_concept}");
+        assert!(long_concept.ends_with("..."), "{long_concept}");
+        assert!(long_concept.chars().count() <= "Assignment Q4: ".len() + 103);
+    }
+
+    fn review_answer_fixtures() -> (
+        MemoryStore,
+        store::McqItem,
+        mcq::ValidatedMcq,
+        mcq::DisplayedMcq,
+        i64,
+    ) {
+        let mut store = MemoryStore::new();
+        let book = store
+            .create_book(
+                &store::NewBook {
+                    title: "T".to_string(),
+                    filepath: "/t.pdf".to_string(),
+                    file_hash: "h".to_string(),
+                    start_page: 1,
+                },
+                "2026-09-27",
+            )
+            .unwrap();
+        let chapter = store
+            .create_chapter(&store::NewChapter {
+                book_id: book.id,
+                index_in_book: 0,
+                level: 1,
+                title: "Ch 1".to_string(),
+                start_page: 1,
+                end_page: 20,
+                file_path: "u1.json".to_string(),
+                status: domain::ChapterStatus::Completed,
+            })
+            .unwrap();
+        let row = mcq::ValidatedMcq {
+            question: "What does &x yield?".to_string(),
+            options: vec![
+                "The address of x".to_string(),
+                "The value of x".to_string(),
+                "A null pointer".to_string(),
+                "A dangling reference".to_string(),
+            ],
+            correct_index: 0,
+            trap_index: 1,
+            explanation: "The & operator takes the address of its operand, plainly stated.".to_string(),
+            topic: "addresses".to_string(),
+            source_refs: mcq::SourceRefs {
+                pages: vec![12],
+                sections: vec!["Addresses".to_string()],
+            },
+        };
+        let items = store
+            .save_mcq_items(
+                &dev_mcq::to_new_items_for(
+                    chapter.id,
+                    mcq::McqPhase::Review,
+                    &[row.clone()],
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let shown = mcq::DisplayedMcq {
+            question: row.question.clone(),
+            displayed_options: row.options.clone(),
+            displayed_correct: 0,
+            displayed_trap: 1,
+            explanation: row.explanation.clone(),
+            topic: row.topic.clone(),
+        };
+        let item = items.into_iter().next().unwrap();
+        (store, item, row, shown, chapter.id)
+    }
+
+    #[test]
+    fn review_correct_boosts_topic_row() {
+        let (mut store, item, row, shown, chapter_id) = review_answer_fixtures();
+        store
+            .create_misconception(
+                chapter_id,
+                "addresses",
+                "took &x for the value",
+                "picked value",
+                "RETEST",
+                "2026-09-27",
+            )
+            .unwrap();
+        let outcome = record_answer(
+            &mut store,
+            item.id,
+            chapter_id,
+            mcq::McqPhase::Review,
+            &row,
+            &shown,
+            0,
+            1,
+            "2026-09-27",
+        )
+        .unwrap();
+        assert!(outcome.is_correct);
+        assert!(!outcome.misconception_logged);
+        let rows = store.list_misconceptions(chapter_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].confidence - 0.6).abs() < 1e-9);
+        assert_eq!(rows[0].status, "IMPROVING");
+    }
+
+    #[test]
+    fn review_wrong_nudges_instead_of_logging() {
+        let (mut store, item, row, shown, chapter_id) = review_answer_fixtures();
+        store
+            .create_misconception(
+                chapter_id,
+                "addresses",
+                "took &x for the value",
+                "picked value",
+                "RETEST",
+                "2026-09-27",
+            )
+            .unwrap();
+        let outcome = record_answer(
+            &mut store,
+            item.id,
+            chapter_id,
+            mcq::McqPhase::Review,
+            &row,
+            &shown,
+            2,
+            1,
+            "2026-09-27",
+        )
+        .unwrap();
+        assert!(!outcome.is_correct);
+        assert!(outcome.misconception_logged);
+        // Nudged in place — no duplicate row.
+        let rows = store.list_misconceptions(chapter_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].confidence - 0.4).abs() < 1e-9);
+        assert_eq!(rows[0].status, "ACTIVE");
+    }
+
+    #[test]
+    fn review_idk_abstains_without_lifecycle_effect() {
+        let (mut store, item, row, shown, chapter_id) = review_answer_fixtures();
+        store
+            .create_misconception(
+                chapter_id,
+                "addresses",
+                "took &x for the value",
+                "picked value",
+                "RETEST",
+                "2026-09-27",
+            )
+            .unwrap();
+        let outcome = record_answer(
+            &mut store,
+            item.id,
+            chapter_id,
+            mcq::McqPhase::Review,
+            &row,
+            &shown,
+            mcq::IDK_INDEX,
+            1,
+            "2026-09-27",
+        )
+        .unwrap();
+        assert!(!outcome.is_correct);
+        assert!(!outcome.misconception_logged);
+        let rows = store.list_misconceptions(chapter_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn review_wrong_without_open_row_logs_fresh() {
+        let (mut store, item, row, shown, chapter_id) = review_answer_fixtures();
+        // No open row (nothing logged yet): the wrong answer is still
+        // evidence, so it falls back to a fresh row like a retest would.
+        let outcome = record_answer(
+            &mut store,
+            item.id,
+            chapter_id,
+            mcq::McqPhase::Review,
+            &row,
+            &shown,
+            2,
+            1,
+            "2026-09-27",
+        )
+        .unwrap();
+        assert!(!outcome.is_correct);
+        assert!(outcome.misconception_logged);
+        let rows = store.list_misconceptions(chapter_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "ACTIVE");
+        assert!((rows[0].confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paint_wraps_only_when_enabled() {
+        assert_eq!(
+            paint("Correct.", GREEN_CODE, true),
+            "\x1b[32mCorrect.\x1b[0m"
+        );
+        assert_eq!(paint("Correct.", GREEN_CODE, false), "Correct.");
+        assert_eq!(
+            paint("Incorrect.", RED_CODE, true),
+            "\x1b[31mIncorrect.\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn question_header_counts_on_a_ruled_line() {
+        assert_eq!(
+            question_header(1, 8, false),
+            "─── Question 1/8 ───"
+        );
+        assert_eq!(
+            question_header(8, 8, false),
+            "─── Question 8/8 ───"
+        );
+        assert_eq!(
+            question_header(2, 8, true),
+            "\x1b[1m─── Question 2/8 ───\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn gate_answers_route_three_ways() {
+        assert_eq!(parse_gate_answer(""), Some(ChapterGate::Proceed));
+        assert_eq!(parse_gate_answer("y"), Some(ChapterGate::Proceed));
+        assert_eq!(parse_gate_answer(" YES "), Some(ChapterGate::Proceed));
+        assert_eq!(parse_gate_answer("s"), Some(ChapterGate::Skip));
+        assert_eq!(parse_gate_answer("Skip"), Some(ChapterGate::Skip));
+        // `n` exits — it never skips.
+        assert_eq!(parse_gate_answer("n"), Some(ChapterGate::Exit));
+        assert_eq!(parse_gate_answer("no"), Some(ChapterGate::Exit));
+        assert_eq!(parse_gate_answer("q"), Some(ChapterGate::Exit));
+        assert_eq!(parse_gate_answer("quit"), Some(ChapterGate::Exit));
+        assert_eq!(parse_gate_answer("exit"), Some(ChapterGate::Exit));
+        assert_eq!(parse_gate_answer("yellow"), None);
+        assert_eq!(parse_gate_answer("snooze"), None);
+    }
+
+    #[test]
+    fn due_and_future_partitions_and_orders() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
+        let task = |id: i64, kind: TaskType, date: &str, status: TaskStatus| Task {
+            id,
+            book_id: 1,
+            chapter_id: id,
+            task_type: kind,
+            scheduled_for: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            status,
+            completed_at: None,
+            sequence: id,
+            attempt_no: 1,
+        };
+        let tasks = vec![
+            task(1, TaskType::Pretest, "2026-09-27", TaskStatus::Pending),
+            task(2, TaskType::Retest, "2026-09-28", TaskStatus::Pending),
+            task(3, TaskType::AssignmentWrite, "2026-09-29", TaskStatus::Pending),
+            task(4, TaskType::Retest, "2026-09-28", TaskStatus::Pending),
+            task(5, TaskType::Read, "2026-09-27", TaskStatus::Done),
+        ];
+        let (due, future) = due_and_future(&tasks, today);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].task_type, TaskType::Pretest);
+        // Future work orders by date, then creation sequence.
+        assert_eq!(
+            future.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![2, 4, 3]
+        );
+    }
+
+    #[test]
+    fn upcoming_tasks_covers_horizon_only() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
+        let task = |id: i64, kind: TaskType, date: &str, status: TaskStatus| Task {
+            id,
+            book_id: 1,
+            chapter_id: id,
+            task_type: kind,
+            scheduled_for: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            status,
+            completed_at: None,
+            sequence: id,
+            attempt_no: 1,
+        };
+        let tasks = vec![
+            task(1, TaskType::Pretest, "2026-09-27", TaskStatus::Pending),
+            task(2, TaskType::Pretest, "2026-09-28", TaskStatus::Pending),
+            task(3, TaskType::Retest, "2026-09-28", TaskStatus::Pending),
+            task(4, TaskType::Retest, "2026-09-29", TaskStatus::Pending),
+            task(5, TaskType::Notes, "2026-10-05", TaskStatus::Pending),
+            task(6, TaskType::Read, "2026-09-28", TaskStatus::Done),
+        ];
+        // Due-today and done rows are excluded; same-date rows follow §6
+        // rank (retest before pretest); the horizon is inclusive.
+        let two_day = upcoming_tasks(&tasks, today, 2);
+        assert_eq!(
+            two_day.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![3, 2, 4]
+        );
+        // A zero horizon covers nothing; a wide one reaches the far task.
+        assert_eq!(upcoming_tasks(&tasks, today, 0).len(), 0);
+        let wide = upcoming_tasks(&tasks, today, 8);
+        assert_eq!(
+            wide.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![3, 2, 4, 5]
+        );
+    }
+
+    /// Picker fixture: ch1 holds Q1 graded + Q2 ungraded; ch2 holds only an
+    /// ungraded question. Returns `(graded_chapter_id, ungraded_chapter_id)`.
+    fn disputable_setup(store: &mut MemoryStore) -> (i64, i64) {
+        let book = store
+            .create_book(
+                &store::NewBook {
+                    title: "T".to_string(),
+                    filepath: "/t.pdf".to_string(),
+                    file_hash: "h".to_string(),
+                    start_page: 1,
+                },
+                "2026-09-25",
+            )
+            .unwrap();
+        let mut chapter = |index: i64, title: &str| {
+            store
+                .create_chapter(&store::NewChapter {
+                    book_id: book.id,
+                    index_in_book: index,
+                    level: 1,
+                    title: title.to_string(),
+                    start_page: 1,
+                    end_page: 20,
+                    file_path: "u.json".to_string(),
+                    status: domain::ChapterStatus::AssignmentComplete,
+                })
+                .unwrap()
+        };
+        let first = chapter(0, "Ch 1");
+        let second = chapter(1, "Ch 2");
+        let mut ask = |chapter_id: i64, position: i64| {
+            store
+                .save_assignment_questions(&[store::NewAssignmentQuestion {
+                    chapter_id,
+                    position,
+                    kind: "written".to_string(),
+                    parts_json: "[\"a) ...\"]".to_string(),
+                    rubric_json: "{}".to_string(),
+                    target_misconception_ids: "[]".to_string(),
+                    attempt_no: 1,
+                }])
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let graded = ask(first.id, 0);
+        ask(first.id, 1);
+        ask(second.id, 0);
+        store
+            .save_grade(&store::NewGrade {
+                question_id: graded.id,
+                score: 7,
+                max_score: 10,
+                classification: "PARTIALLY_CORRECT".to_string(),
+                criteria_results_json: "[]".to_string(),
+                feedback: "Mostly right.".to_string(),
+                grader_version: "v3".to_string(),
+                created_at: "2026-09-26".to_string(),
+            })
+            .unwrap();
+        (first.id, second.id)
+    }
+
+    #[test]
+    fn disputable_chapters_lists_graded_only() {
+        let mut store = MemoryStore::new();
+        assert!(disputable_chapters(&store).unwrap().is_empty());
+        let (graded_id, _) = disputable_setup(&mut store);
+        let candidates = disputable_chapters(&store).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].chapter.id, graded_id);
+        // Only the graded question appears, at its 1-based position.
+        assert_eq!(candidates[0].questions.len(), 1);
+        let only = &candidates[0].questions[0];
+        assert_eq!(only.position, 1);
+        assert_eq!((only.score, only.max_score), (7, 10));
+        assert_eq!(only.classification, "PARTIALLY_CORRECT");
+    }
+
+    #[test]
+    fn parse_pick_accepts_bounds_rejects_garbage() {
+        assert_eq!(parse_pick("1", 2).unwrap(), 1);
+        assert_eq!(parse_pick("  2  ", 2).unwrap(), 2);
+        assert!(parse_pick("0", 2).is_err());
+        assert!(parse_pick("3", 2).is_err());
+        assert!(parse_pick("x", 2).is_err());
+        assert!(parse_pick("", 2).is_err());
+    }
+
+    #[test]
+    fn resolve_dispute_target_passes_explicit_ids() {
+        let mut store = MemoryStore::new();
+        assert!(resolve_dispute_target(&store, Some(1), Some(1)).is_err());
+        let (graded_id, ungraded_id) = disputable_setup(&mut store);
+        assert_eq!(
+            resolve_dispute_target(&store, Some(graded_id), Some(1)).unwrap(),
+            (graded_id, 1)
+        );
+        // Q2 exists but has no grade — not disputable.
+        assert!(resolve_dispute_target(&store, Some(graded_id), Some(2)).is_err());
+        // Ch2 has questions but no grades at all.
+        assert!(resolve_dispute_target(&store, Some(ungraded_id), Some(1)).is_err());
+        assert!(resolve_dispute_target(&store, Some(999), Some(1)).is_err());
+        // No ids under test stdin (non-terminal) fails instead of blocking.
+        assert!(resolve_dispute_target(&store, None, None).is_err());
+    }
+
+    #[test]
+    fn continue_prompt_needs_explicit_yes() {
+        assert!(parse_continue_answer("y"));
+        assert!(parse_continue_answer("YES"));
+        assert!(parse_continue_answer("  yes  "));
+        assert!(!parse_continue_answer(""));
+        assert!(!parse_continue_answer("n"));
+        assert!(!parse_continue_answer("q"));
+        assert!(!parse_continue_answer("yeah"));
+    }
+
+    #[test]
+    fn stored_notes_returns_latest_and_fails_loudly() {
+        let mut store = MemoryStore::new();
+        let book = store
+            .create_book(
+                &store::NewBook {
+                    title: "T".to_string(),
+                    filepath: "/t.pdf".to_string(),
+                    file_hash: "h".to_string(),
+                    start_page: 1,
+                },
+                "2026-09-25",
+            )
+            .unwrap();
+        let chapter = store
+            .create_chapter(&store::NewChapter {
+                book_id: book.id,
+                index_in_book: 0,
+                level: 1,
+                title: "Ch 1".to_string(),
+                start_page: 1,
+                end_page: 20,
+                file_path: "u.json".to_string(),
+                status: domain::ChapterStatus::Completed,
+            })
+            .unwrap();
+        assert!(stored_notes_markdown(&store, 999).is_err());
+        assert!(stored_notes_markdown(&store, chapter.id).is_err());
+        let note = |body: &str| store::NewNote {
+            chapter_id: chapter.id,
+            content_markdown: body.to_string(),
+            generated_at: "2026-09-26".to_string(),
+            attempt_no: 1,
+        };
+        store.save_note(&note("first")).unwrap();
+        store.save_note(&note("second")).unwrap();
+        assert_eq!(stored_notes_markdown(&store, chapter.id).unwrap(), "second");
+    }
+
+    fn purge_question(targets_json: &str) -> store::AssignmentQuestion {        store::AssignmentQuestion {
+            id: 7,
+            chapter_id: 1,
+            position: 0,
+            kind: "written".to_string(),
+            parts_json: "[]".to_string(),
+            rubric_json: "{}".to_string(),
+            target_misconception_ids: targets_json.to_string(),
+            attempt_no: 1,
+        }
+    }
+
+    #[test]
+    fn dispute_purge_revised_clears_targets_and_logged_row() {
+        let mut store = MemoryStore::new();
+        let target = store
+            .create_misconception(1, "aliasing", "addr vs value", "picked trap", "RETEST", "2026-09-25")
+            .unwrap();
+        let logged = store
+            .create_misconception(
+                1,
+                "Assignment Q1: Explain &x",
+                "Graded INCORRECT 2/8: confused address with value",
+                "Answer excerpt: I think &x gives the value",
+                "ASSIGNMENT",
+                "2026-09-25",
+            )
+            .unwrap();
+        let resolved = store
+            .create_misconception(1, "scales", "only 1,2,4,8", "fixed earlier", "RETEST", "2026-09-24")
+            .unwrap();
+        store
+            .update_misconception(resolved.id, 0.9, "RESOLVED", "2026-09-25", Some("2026-09-25"))
+            .unwrap();
+        // Unknown target 999 is stale — reported and skipped, never fatal.
+        let question = purge_question(&format!("[{}, 999]", target.id));
+        let purged = apply_dispute_purge(
+            &mut store,
+            &question,
+            dispute::DisputeAction::Revised,
+            "2026-09-26",
+        )
+        .unwrap();
+        assert_eq!(purged, 2);
+        let rows = store.list_misconceptions(1).unwrap();
+        let status_of = |id: i64| {
+            rows.iter()
+                .find(|row| row.id == id)
+                .map(|row| row.status.clone())
+                .unwrap()
+        };
+        assert_eq!(status_of(target.id), "DISPUTED");
+        assert_eq!(status_of(logged.id), "DISPUTED");
+        // Resolved on earlier evidence — the bad grade never touched it.
+        assert_eq!(status_of(resolved.id), "RESOLVED");
+        // Confidence is preserved through the purge, not zeroed.
+        let purged_row = rows.iter().find(|row| row.id == target.id).unwrap();
+        assert!((purged_row.confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dispute_purge_upheld_purges_nothing_corrupt_targets_still_purge_log() {
+        let mut store = MemoryStore::new();
+        let logged = store
+            .create_misconception(
+                1,
+                "Assignment Q1: Explain &x",
+                "Graded INCORRECT 2/8: confused address with value",
+                "Answer excerpt: I think &x gives the value",
+                "ASSIGNMENT",
+                "2026-09-25",
+            )
+            .unwrap();
+        let question = purge_question(&format!("[{}]", logged.id));
+        let purged =
+            apply_dispute_purge(&mut store, &question, dispute::DisputeAction::Upheld, "2026-09-26")
+                .unwrap();
+        assert_eq!(purged, 0);
+        let corrupt = purge_question("{broken");
+        let purged = apply_dispute_purge(
+            &mut store,
+            &corrupt,
+            dispute::DisputeAction::QuestionDefective,
+            "2026-09-26",
+        )
+        .unwrap();
+        assert_eq!(purged, 1);
+        let rows = store.list_misconceptions(1).unwrap();
+        assert_eq!(rows[0].status, "DISPUTED");
+    }
+
+    fn evidence_date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn chapter_evidence_aggregates_store_rows() {
+        let mut store = MemoryStore::new();
+        let chapter = store
+            .create_chapter(&store::NewChapter {
+                book_id: 1,
+                index_in_book: 0,
+                level: 1,
+                title: "Pointers".to_string(),
+                start_page: 10,
+                end_page: 19,
+                file_path: "unit_0.json".to_string(),
+                status: domain::ChapterStatus::Completed,
+            })
+            .unwrap();
+        let first = store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: chapter.id,
+                task_type: TaskType::Retest,
+                scheduled_for: evidence_date(2026, 9, 20),
+                sequence: 1,
+                attempt_no: 1,
+            })
+            .unwrap();
+        let second = store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: chapter.id,
+                task_type: TaskType::AssignmentWrite,
+                scheduled_for: evidence_date(2026, 9, 20),
+                sequence: 2,
+                attempt_no: 1,
+            })
+            .unwrap();
+        let done = store.complete_task(first.id, "2026-09-20").unwrap();
+        assert_eq!(done.status, TaskStatus::Done);
+        store.complete_task(second.id, "2026-09-21").unwrap();
+        let items = store
+            .save_mcq_items(&[
+                store::NewMcqItem {
+                    chapter_id: chapter.id,
+                    phase: "pretest".to_string(),
+                    question_text: "What does &x yield?".to_string(),
+                    options_json: "[\"a\",\"b\",\"c\",\"d\"]".to_string(),
+                    correct_index: 0,
+                    trap_index: 1,
+                    explanation_text: "Address-of.".to_string(),
+                    source_refs: "{}".to_string(),
+                    topic: "aliasing".to_string(),
+                    attempt_no: 1,
+                },
+                store::NewMcqItem {
+                    chapter_id: chapter.id,
+                    phase: "pretest".to_string(),
+                    question_text: "What is a dangling pointer?".to_string(),
+                    options_json: "[\"a\",\"b\",\"c\",\"d\"]".to_string(),
+                    correct_index: 0,
+                    trap_index: 2,
+                    explanation_text: "Freed memory.".to_string(),
+                    source_refs: "{}".to_string(),
+                    topic: "lifetimes".to_string(),
+                    attempt_no: 1,
+                },
+            ])
+            .unwrap();
+        store
+            .record_mcq_response(items[0].id, 0, true, false, "2026-09-20", 1)
+            .unwrap();
+        store
+            .record_mcq_response(items[1].id, 1, false, true, "2026-09-20", 1)
+            .unwrap();
+        let questions = store
+            .save_assignment_questions(&[store::NewAssignmentQuestion {
+                chapter_id: chapter.id,
+                position: 0,
+                kind: "written".to_string(),
+                parts_json: "[]".to_string(),
+                rubric_json: "{}".to_string(),
+                target_misconception_ids: "[]".to_string(),
+                attempt_no: 1,
+            }])
+            .unwrap();
+        let grade = store
+            .save_grade(&store::NewGrade {
+                question_id: questions[0].id,
+                score: 6,
+                max_score: 8,
+                classification: "PARTIALLY_CORRECT".to_string(),
+                criteria_results_json: "[]".to_string(),
+                feedback: "Half right.".to_string(),
+                grader_version: "v3".to_string(),
+                created_at: "2026-09-21".to_string(),
+            })
+            .unwrap();
+        store
+            .record_dispute(&store::NewDispute {
+                grade_id: grade.id,
+                text: "Rubric misapplied.".to_string(),
+                decision: "REVISED".to_string(),
+                final_score: 8,
+                adjudication_json: "{}".to_string(),
+                adjudicator_model: "test".to_string(),
+                timestamp: "2026-09-22".to_string(),
+            })
+            .unwrap();
+        store
+            .create_misconception(chapter.id, "aliasing", "addr vs value", "picked trap", "RETEST", "2026-09-20")
+            .unwrap();
+        let fixed = store
+            .create_misconception(chapter.id, "scales", "only 1,2,4,8", "fixed", "RETEST", "2026-09-19")
+            .unwrap();
+        store
+            .update_misconception(fixed.id, 0.9, "RESOLVED", "2026-09-20", Some("2026-09-20"))
+            .unwrap();
+
+        let ev = chapter_evidence(&store, &chapter).unwrap();
+        assert_eq!(ev.pages, 10);
+        assert_eq!(ev.completed_on, Some(evidence_date(2026, 9, 21)));
+        assert_eq!((ev.pretest_correct, ev.pretest_answered), (1, 2));
+        assert_eq!((ev.retest_correct, ev.retest_answered), (0, 0));
+        // The disputed grade counts at its corrected award, not the original.
+        assert_eq!((ev.assignment_earned, ev.assignment_possible), (8, 8));
+        assert_eq!((ev.active_misconceptions, ev.resolved_misconceptions), (1, 1));
+    }
+
+    #[test]
+    fn single_book_guard_summarizes_progress() {
+        let mut store = MemoryStore::new();
+        let book = store
+            .create_book(
+                &store::NewBook {
+                    title: "Modern C".to_string(),
+                    filepath: "modern.pdf".to_string(),
+                    file_hash: "h".to_string(),
+                    start_page: 18,
+                },
+                "2026-09-29",
+            )
+            .unwrap();
+        for (index, (start, end, status)) in
+            [(18, 37, domain::ChapterStatus::Completed), (38, 43, domain::ChapterStatus::Skipped), (44, 53, domain::ChapterStatus::PretestReady)]
+                .iter()
+                .copied()
+                .enumerate()
+        {
+            store
+                .create_chapter(&store::NewChapter {
+                    book_id: book.id,
+                    index_in_book: i64::try_from(index).unwrap_or(0),
+                    level: 1,
+                    title: format!("Ch {index}"),
+                    start_page: start,
+                    end_page: end,
+                    file_path: "u.json".to_string(),
+                    status,
+                })
+                .unwrap();
+        }
+        let progress = book_progress(&store, &book).unwrap();
+        assert_eq!(progress.done, 1);
+        assert_eq!(progress.total, 3);
+        assert_eq!(progress.skipped, 1);
+        assert_eq!(progress.pages_done, 20);
+        assert_eq!(progress.pages_total, 36);
+        assert_eq!(
+            format_book_progress(&progress),
+            "  Modern C: 1/3 (33%) chapters, 1 skipped, 20/36 pages"
+        );
+        let empty = store
+            .create_book(
+                &store::NewBook {
+                    title: "Empty".to_string(),
+                    filepath: "e.pdf".to_string(),
+                    file_hash: "e".to_string(),
+                    start_page: 1,
+                },
+                "2026-09-29",
+            )
+            .unwrap();
+        assert_eq!(
+            format_book_progress(&book_progress(&store, &empty).unwrap()),
+            "  Empty: 0/0 (n/a) chapters, 0/0 pages"
+        );
+    }
+
+    #[test]
+    fn metrics_commands_succeed_on_empty_store() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let today = evidence_date(2026, 9, 27);
+        run_metrics(&store, today).unwrap();
+        run_misconceptions(&store).unwrap();
+        run_progress(&store).unwrap();
+    }
+}

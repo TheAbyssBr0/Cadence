@@ -1,0 +1,66 @@
+[package]
+name = "cadence"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+toml = { version = "0.8", features = ["parse"] }
+thiserror = "2"
+fs2 = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+mupdf = { version = "=0.8.0", default-features = false, features = ["base14-fonts"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[lints.rust]
+unsafe_code = "deny"
+# warn during iteration; promote to "deny" at the first milestone (public API settled).
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+arithmetic_side_effects = "allow" # too noisy as a deny; overflow-checks in release is the backstop
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+unchecked_time_subtraction = "deny"
+string_slice = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+exit = "deny"
+as_conversions = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+print_stderr = "deny"
+missing_assert_message = "deny"
+lossy_float_literal = "deny"
+clone_on_ref_ptr = "deny"
+
+# Local-iteration profiles only. Ignored when this crate is built as a dependency;
+# downstream users' top-level profiles control the final build.
+[profile.dev]
+opt-level = 1            # faster numeric tests; debug assertions and overflow checks stay on
+
+[profile.release]
+# Note: fat LTO + codegen-units = 1 slows local release builds for better benchmark
+# fidelity. Loosen (e.g. remove lto / raise codegen-units) if iteration speed matters more.
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
+debug = "line-tables-only"
+
+[profile.checked]        # release speed with every debug_assert! on: cargo run --profile checked
+inherits = "release"
+debug-assertions = true

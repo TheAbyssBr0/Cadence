@@ -1,0 +1,3 @@
+[toolchain]
+channel = "nightly-2026-09-07"  # pinned per BOOTSTRAP.md; `rustup show` installs it
+components = ["clippy", "rustfmt"]
