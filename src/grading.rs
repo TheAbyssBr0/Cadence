@@ -481,6 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn boundary_scores_accepted() {
+        // Total and per-criterion zeros are valid (not "negative").
+        let mut zero = good_grade();
+        zero["score"] = serde_json::json!(0);
+        zero["criteria_results"][0]["score"] = serde_json::json!(0);
+        zero["criteria_results"][1]["score"] = serde_json::json!(0);
+        let grade = validate_grade(&zero.to_string(), &rubric()).unwrap();
+        assert_eq!(grade.score, 0);
+        // Totals and criteria at exactly max are valid (not "over").
+        let mut full = good_grade();
+        full["score"] = serde_json::json!(8);
+        let grade = validate_grade(&full.to_string(), &rubric()).unwrap();
+        assert_eq!(grade.score, 8);
+    }
+
+    #[test]
     fn criterion_coverage_gates() {
         // Missing one criterion.
         let mut short = good_grade();

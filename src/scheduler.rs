@@ -748,6 +748,46 @@ mod tests {
     }
 
     #[test]
+    fn overdue_excludes_today_done_and_future() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        let tasks = vec![
+            task(TaskType::Retest, "2026-01-09", TaskStatus::Pending, 1),
+            task(TaskType::Retest, "2026-01-10", TaskStatus::Pending, 2),
+            task(TaskType::Retest, "2026-01-08", TaskStatus::Done, 3),
+            task(TaskType::Retest, "2026-01-11", TaskStatus::Pending, 4),
+        ];
+        let over = overdue_tasks(&tasks, today);
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].sequence, 1);
+    }
+
+    #[test]
+    fn sequence_continues_past_max() {
+        assert_eq!(next_sequence(&[]), 1);
+        let tasks = vec![
+            task(TaskType::Pretest, "2026-01-10", TaskStatus::Pending, 3),
+            task(TaskType::Pretest, "2026-01-10", TaskStatus::Pending, 7),
+        ];
+        assert_eq!(next_sequence(&tasks), 8);
+    }
+
+    #[test]
+    fn pending_matching_requires_all_fields() {
+        let tasks = vec![task(
+            TaskType::Pretest,
+            "2026-01-10",
+            TaskStatus::Pending,
+            7,
+        )];
+        assert!(has_pending_for(&tasks, 7, 1, TaskType::Pretest));
+        assert!(!has_pending_for(&tasks, 8, 1, TaskType::Pretest));
+        assert!(!has_pending_for(&tasks, 7, 2, TaskType::Pretest));
+        assert!(!has_pending_for(&tasks, 7, 1, TaskType::Retest));
+        let done = vec![task(TaskType::Pretest, "2026-01-10", TaskStatus::Done, 7)];
+        assert!(!has_pending_for(&done, 7, 1, TaskType::Pretest));
+    }
+
+    #[test]
     fn notes_beats_pretest_same_day() {
         // Regression: after grading, NOTES (chapter closure) must run before
         // the next chapter's PRETEST, not after it.
@@ -1216,6 +1256,8 @@ mod tests {
         // and compacts forward (K+1 = next non-skipped, §4.1).
         let chapters = store.list_chapters(book).unwrap();
         assert_eq!(count_skipped(&chapters), 1);
+        let none: Vec<crate::domain::Chapter> = Vec::new();
+        assert_eq!(count_skipped(&none), 0);
         let compacted = ensure_tasks(&mut store, book, today, "2026-01-10").unwrap();
         assert_eq!(compacted.len(), 1);
         assert_eq!(compacted[0].task_type, TaskType::Pretest);

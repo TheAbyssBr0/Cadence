@@ -1133,6 +1133,56 @@ mod tests {
     }
 
     #[test]
+    fn detector_boundaries() {
+        // All three IDK spellings match; near-misses do not.
+        assert!(is_idk_smuggle("I don't know"));
+        assert!(is_idk_smuggle("i dont know"));
+        assert!(is_idk_smuggle("e) i don't know"));
+        assert!(!is_idk_smuggle("I don't know everything"));
+        assert!(!is_idk_smuggle("dunno"));
+        // Word chars: alphanumerics and underscore only.
+        assert!(is_word_char('a'));
+        assert!(is_word_char('7'));
+        assert!(is_word_char('_'));
+        assert!(!is_word_char(' '));
+        assert!(!is_word_char('.'));
+        // Whole-word occurrence needs non-word guards on BOTH sides.
+        assert!(contains_phrase("see listing here", "listing"));
+        assert!(!contains_phrase("see alisting here", "listing"));
+        assert!(!contains_phrase("see listing7 here", "listing"));
+    }
+
+    #[test]
+    fn index_bounds_reject_each_side() {
+        let mut bad_correct = good_item_json();
+        bad_correct["correct_index"] = serde_json::json!(4);
+        assert!(validate_mcq_set(&set_with(&bad_correct, 8), &unit()).is_err());
+        let mut bad_trap = good_item_json();
+        bad_trap["trap_index"] = serde_json::json!(4);
+        assert!(validate_mcq_set(&set_with(&bad_trap, 8), &unit()).is_err());
+    }
+
+    #[test]
+    fn refs_and_counts_accept_edges() {
+        // Unit-edge pages are inside the range.
+        let mut low = good_item_json();
+        low["source_refs"]["pages"] = serde_json::json!([10]);
+        assert!(validate_mcq_set(&set_with(&low, 8), &unit()).is_ok());
+        let mut high = good_item_json();
+        high["source_refs"]["pages"] = serde_json::json!([20]);
+        assert!(validate_mcq_set(&set_with(&high, 8), &unit()).is_ok());
+        // Exactly MAX_QUESTIONS is valid, not over.
+        assert!(validate_mcq_set(&set_with(&good_item_json(), 12), &unit()).is_ok());
+    }
+
+    #[test]
+    fn shuffle_order_is_deterministic_per_seed() {
+        // Golden vectors: any PRNG-operator change alters these outputs.
+        assert_eq!(shuffle_order(7), [2, 1, 3, 0]);
+        assert_eq!(shuffle_order(1234), [3, 2, 1, 0]);
+    }
+
+    #[test]
     fn accepts_valid_set() {
         let text = set_with(&good_item_json(), 8);
         let items = validate_mcq_set(&text, &unit()).unwrap();

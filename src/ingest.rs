@@ -332,6 +332,76 @@ mod tests {
         }
     }
 
+    struct StubSource;
+
+    impl PdfSource for StubSource {
+        fn outline(&self, _start_page: i64) -> Result<Vec<UnitBoundary>> {
+            Ok(Vec::new())
+        }
+
+        fn text_for_range(&self, start_page: i64, end_page: i64) -> Result<UnitText> {
+            Ok(UnitText {
+                text: format!("pages {start_page}-{end_page}"),
+                page_start: start_page,
+                page_end: end_page,
+                heading: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn manual_heading_prefers_shallowest_inside() {
+        let bounds = vec![
+            boundary("Deep", 21, 3),
+            boundary("Shallow", 22, 1),
+            boundary("Mid", 25, 2),
+        ];
+        // Shallowest inside wins regardless of order.
+        assert_eq!(heading_for(&bounds, 20, 30), ("Shallow".to_string(), 1));
+        // Range edges are inclusive: entries exactly on start/end count.
+        assert_eq!(heading_for(&bounds, 21, 21), ("Deep".to_string(), 3));
+        assert_eq!(heading_for(&bounds, 25, 25), ("Mid".to_string(), 2));
+        // Nothing inside: nearest at-or-before start (start itself qualifies).
+        assert_eq!(heading_for(&bounds, 23, 24), ("Shallow".to_string(), 1));
+        assert_eq!(heading_for(&bounds, 22, 24), ("Shallow".to_string(), 1));
+        // On-start entries count as inside even when shallower later entries
+        // exist; on-end entries count too.
+        let edged = vec![boundary("S", 22, 1), boundary("T", 23, 3)];
+        assert_eq!(heading_for(&edged, 22, 24), ("S".to_string(), 1));
+        let single_end = vec![boundary("B", 25, 1)];
+        assert_eq!(heading_for(&single_end, 20, 25), ("B".to_string(), 1));
+        // Same page: first wins unless a shallower entry shares it.
+        let tied = vec![boundary("A", 22, 2), boundary("B", 22, 2)];
+        assert_eq!(heading_for(&tied, 20, 30), ("A".to_string(), 2));
+        let shared = vec![boundary("A", 22, 2), boundary("B", 22, 1)];
+        assert_eq!(heading_for(&shared, 20, 30), ("B".to_string(), 1));
+        // Nothing at or before: untitled.
+        assert_eq!(heading_for(&bounds, 10, 15), ("Untitled".to_string(), 1));
+        // Same-page before-search: first wins ties and deeper pages never
+        // displace; only a shallower same-page entry takes over.
+        let same_level = vec![boundary("A", 20, 1), boundary("B", 20, 1)];
+        assert_eq!(heading_for(&same_level, 25, 28), ("A".to_string(), 1));
+        let deeper_later = vec![boundary("A", 20, 1), boundary("B", 20, 3)];
+        assert_eq!(heading_for(&deeper_later, 25, 28), ("A".to_string(), 1));
+        let nearer_older = vec![boundary("A", 22, 3), boundary("B", 20, 1)];
+        assert_eq!(heading_for(&nearer_older, 25, 28), ("A".to_string(), 3));
+    }
+
+    #[test]
+    fn extract_units_attaches_headings() {
+        let units = vec![crate::engines::PlannedUnit {
+            heading: "Ch 1".to_string(),
+            level: 2,
+            start_page: 20,
+            end_page: 27,
+        }];
+        let ready = extract_units(&StubSource, &units, "hash1").unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].heading, "Ch 1");
+        assert_eq!(ready[0].text.heading, "Ch 1");
+        assert!(ready[0].text.text.contains("20-27"));
+    }
+
     #[test]
     fn hashes_stably() {
         assert_eq!(

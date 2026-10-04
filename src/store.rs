@@ -3351,6 +3351,53 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_chapter_status_attempt_and_listing() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let book = store.create_book(&sample_book(), "2026-01-01").unwrap();
+        let chapter = store
+            .create_chapter(&NewChapter {
+                book_id: book.id,
+                index_in_book: 0,
+                level: 1,
+                title: "Ch 1".to_string(),
+                start_page: 25,
+                end_page: 60,
+                file_path: "unit_1.json".to_string(),
+                status: ChapterStatus::PretestReady,
+            })
+            .unwrap();
+        // Listing reflects stored rows.
+        let listed = store.list_chapters(book.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Ch 1");
+        // Status transitions persist; missing rows report NotFound.
+        store
+            .set_chapter_status(chapter.id, ChapterStatus::PretestComplete)
+            .unwrap();
+        assert_eq!(
+            store.get_chapter(chapter.id).unwrap().status,
+            ChapterStatus::PretestComplete
+        );
+        assert!(matches!(
+            store
+                .set_chapter_status(9999, ChapterStatus::Skipped)
+                .unwrap_err(),
+            Error::NotFound(_)
+        ));
+        // Attempt bounds: 0 rejected, 1 accepted, persisted on read-back.
+        assert!(matches!(
+            store.set_chapter_attempt(chapter.id, 0).unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        store.set_chapter_attempt(chapter.id, 2).unwrap();
+        assert_eq!(store.get_chapter(chapter.id).unwrap().attempt_no, 2);
+        assert!(matches!(
+            store.set_chapter_attempt(9999, 1).unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
     fn sqlite_tasks_round_trip() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let book = store.create_book(&sample_book(), "2026-01-01").unwrap();
@@ -3382,6 +3429,51 @@ mod tests {
         assert_eq!(fetched.scheduled_for, date);
         let listed = store.list_tasks().unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_pending_delete_counts_and_task_bounds() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let book = store.create_book(&sample_book(), "2026-01-01").unwrap();
+        let chapter = store
+            .create_chapter(&NewChapter {
+                book_id: book.id,
+                index_in_book: 0,
+                level: 1,
+                title: "Ch 1".to_string(),
+                start_page: 25,
+                end_page: 60,
+                file_path: "unit_1.json".to_string(),
+                status: ChapterStatus::PretestReady,
+            })
+            .unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let new_task = || NewTask {
+            book_id: book.id,
+            chapter_id: chapter.id,
+            task_type: TaskType::Pretest,
+            scheduled_for: date,
+            sequence: 1,
+            attempt_no: 1,
+        };
+        // Attempt bounds: 0 rejected.
+        let mut bad = new_task();
+        bad.attempt_no = 0;
+        assert!(matches!(
+            store.create_task(&bad).unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        store.create_task(&new_task()).unwrap();
+        store.create_task(&new_task()).unwrap();
+        // Pending deletes report exact counts; second pass deletes nothing.
+        assert_eq!(
+            store.delete_pending_tasks_for_chapter(chapter.id).unwrap(),
+            2
+        );
+        assert_eq!(
+            store.delete_pending_tasks_for_chapter(chapter.id).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -3467,6 +3559,39 @@ mod tests {
             .unwrap();
         let hit = store.get_llm_cache("h9").unwrap().unwrap();
         assert_eq!(hit.response_json, "ok2");
+        // Attempts on missing jobs fail loudly, not silently Ok.
+        assert!(
+            store
+                .record_llm_attempt(9999, 1, "FAILED", None, None, Some("x"))
+                .is_err()
+        );
+        // Events persist: the log grows by exactly one row per call.
+        let count_events = |conn: &rusqlite::Connection| {
+            conn.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = count_events(&store.conn);
+        store
+            .log_event("SMOKE", Some(1), None, Some("e"), "2026-01-01")
+            .unwrap();
+        assert_eq!(count_events(&store.conn), before + 1);
+    }
+
+    #[test]
+    fn open_creates_missing_parent_dirs() {
+        let base: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), ".scratch", "open-nested-test"]
+            .iter()
+            .collect();
+        let _ = std::fs::remove_dir_all(&base);
+        // DB and lock live under DIFFERENT missing parents, so each guard is
+        // load-bearing on its own (a shared parent would mask a skipped one).
+        let db_path = base.join("deep-db").join("nested").join("cadence.db");
+        let lock_path = base.join("deep-lock").join("nested").join("cadence.lock");
+        let store = SqliteStore::open(&db_path, &lock_path).unwrap();
+        assert!(db_path.is_file());
+        assert!(lock_path.is_file());
+        assert_eq!(store.list_books().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -3551,6 +3676,20 @@ mod tests {
     }
 
     #[test]
+    fn memory_chapter_attempt_bounds() {
+        let mut store = MemoryStore::new();
+        let chapter = chapter_for(&mut store);
+        assert!(matches!(
+            store.set_chapter_attempt(chapter.id, 0).unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        store.set_chapter_attempt(chapter.id, 1).unwrap();
+        assert_eq!(store.get_chapter(chapter.id).unwrap().attempt_no, 1);
+        store.set_chapter_attempt(chapter.id, 3).unwrap();
+        assert_eq!(store.get_chapter(chapter.id).unwrap().attempt_no, 3);
+    }
+
+    #[test]
     fn mcq_round_trip_memory() {
         let mut store = MemoryStore::new();
         let chapter = chapter_for(&mut store);
@@ -3605,6 +3744,10 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(!responses[0].is_correct);
         assert!(responses[0].selected_trap);
+        // Attempt bounds: 0 rejected on this backend too.
+        let mut bad = sample_mcq_items(chapter.id);
+        bad[0].attempt_no = 0;
+        assert!(store.save_mcq_items(&bad).is_err());
     }
 
     #[test]
@@ -3653,6 +3796,44 @@ mod tests {
     }
 
     #[test]
+    fn assignment_delete_matches_both_ids() {
+        let mut stores: Vec<Box<dyn Store>> = vec![
+            Box::new(MemoryStore::new()),
+            Box::new(SqliteStore::open_in_memory().unwrap()),
+        ];
+        for store in &mut stores {
+            let chapter = chapter_for(store.as_mut());
+            store
+                .save_assignment_questions(&sample_assignment_questions(chapter.id, 1))
+                .unwrap();
+            store
+                .save_assignment_questions(&sample_assignment_questions(chapter.id, 2))
+                .unwrap();
+            // Deleting attempt 1 leaves attempt 2 alone: both ids must match.
+            assert_eq!(
+                store
+                    .delete_assignment_questions_for(chapter.id, 1)
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                store
+                    .list_assignment_questions(chapter.id, 2)
+                    .unwrap()
+                    .len(),
+                4
+            );
+            assert_eq!(
+                store
+                    .list_assignment_questions(chapter.id, 1)
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn assignment_round_trip_both_backends() {
         let mut stores: Vec<Box<dyn Store>> = vec![
             Box::new(MemoryStore::new()),
@@ -3669,14 +3850,6 @@ mod tests {
             let listed = store.list_assignment_questions(chapter.id, 1).unwrap();
             assert_eq!(listed.len(), 4);
             assert!(listed.windows(2).all(|w| w[0].position <= w[1].position));
-            // Attempts are isolated.
-            assert_eq!(
-                store
-                    .list_assignment_questions(chapter.id, 2)
-                    .unwrap()
-                    .len(),
-                0
-            );
             let response = store
                 .record_assignment_response(saved[0].id, "my answer", "2026-01-07", 1)
                 .unwrap();
@@ -3703,8 +3876,17 @@ mod tests {
                     .len(),
                 0
             );
+            // Orphaned responses go with their questions (checked before any
+            // re-save, which would mask an inverted retain).
             assert_eq!(
                 store.list_assignment_responses(saved[0].id).unwrap().len(),
+                0
+            );
+            assert_eq!(
+                store
+                    .list_assignment_questions(chapter.id, 1)
+                    .unwrap()
+                    .len(),
                 0
             );
             assert_eq!(
@@ -3954,6 +4136,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        // Every migration gate ran: each version's tables exist (a skipped
+        // gate leaves its tables missing even though the version lands).
+        let tables: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        for table in [
+            "mcq_items",
+            "mcq_responses",
+            "misconceptions",
+            "assignment_questions",
+            "assignment_responses",
+            "grades",
+            "disputes",
+            "notes",
+        ] {
+            assert!(tables.contains(&table.to_string()), "missing {table}");
+        }
         // Legacy rows survive with backfilled attempt 1.
         let chapter = store.get_chapter(1).unwrap();
         assert_eq!(chapter.attempt_no, 1);
@@ -3972,6 +4176,33 @@ mod tests {
         drop(store);
         let store2 = SqliteStore::open(&db_path, &lock_path).unwrap();
         assert_eq!(store2.get_chapter(1).unwrap().attempt_no, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database newer than [`SCHEMA_VERSION`] is rejected (not migrated).
+    #[test]
+    fn rejects_newer_schema() {
+        let dir: std::path::PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            ".scratch",
+            "migration-newer-test",
+        ]
+        .iter()
+        .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("cadence.db");
+        let lock_path = dir.join("cadence.lock");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE version (id INTEGER PRIMARY KEY CHECK (id = 1), schema_version INTEGER NOT NULL);
+                 INSERT INTO version (id, schema_version) VALUES (1, 999);",
+            )
+            .unwrap();
+        }
+        let err = SqliteStore::open(&db_path, &lock_path).unwrap_err();
+        assert!(err.to_string().contains("newer than supported"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4055,6 +4286,65 @@ mod tests {
     }
 
     #[test]
+    fn grade_input_bounds() {
+        // Boundary awards are valid: zero score, max of one.
+        let mut tiny = sample_grade(1);
+        tiny.score = 0;
+        tiny.max_score = 1;
+        assert!(check_grade_input(&tiny).is_ok());
+        tiny.score = 1;
+        assert!(check_grade_input(&tiny).is_ok());
+        // Outside the bounds fails loudly.
+        tiny.score = -1;
+        assert!(check_grade_input(&tiny).is_err());
+        tiny.score = 2;
+        assert!(check_grade_input(&tiny).is_err());
+        tiny.max_score = 0;
+        tiny.score = 0;
+        assert!(check_grade_input(&tiny).is_err());
+    }
+
+    #[test]
+    fn grades_payload_and_bounds_both_backends() {
+        let mut stores: Vec<Box<dyn Store>> = vec![
+            Box::new(MemoryStore::new()),
+            Box::new(SqliteStore::open_in_memory().unwrap()),
+        ];
+        for store in &mut stores {
+            let chapter = chapter_for(store.as_mut());
+            let questions = store
+                .save_assignment_questions(&sample_assignment_questions(chapter.id, 1))
+                .unwrap();
+            let saved = store.save_grade(&sample_grade(questions[0].id)).unwrap();
+            // The listed row carries the same undisputed state.
+            assert!(!store.list_grades_for_question(questions[0].id).unwrap()[0].disputed);
+            store.record_dispute(&sample_dispute(saved.id)).unwrap();
+            // Auditor payload lands on the grade row, not just the dispute.
+            let corrected = store.get_grade(saved.id).unwrap();
+            assert_eq!(
+                corrected.dispute_text.as_deref(),
+                Some("Scales exclude 5, so one lea is impossible.")
+            );
+            assert_eq!(
+                corrected.adjudication_json.as_deref(),
+                Some("{\"action\":\"REVISED\"}")
+            );
+            // A zero final score is valid (not "negative").
+            let mut zeroed = sample_dispute(saved.id);
+            zeroed.final_score = 0;
+            store.record_dispute(&zeroed).unwrap();
+            assert_eq!(store.get_grade(saved.id).unwrap().final_score, Some(0));
+            // Boundary awards fail loudly: zero max, negative score.
+            let mut bad_max = sample_grade(questions[0].id);
+            bad_max.max_score = 0;
+            assert!(store.save_grade(&bad_max).is_err());
+            let mut negative = sample_grade(questions[0].id);
+            negative.score = -1;
+            assert!(store.save_grade(&negative).is_err());
+        }
+    }
+
+    #[test]
     fn grades_disputes_round_trip_both_backends() {
         let mut stores: Vec<Box<dyn Store>> = vec![
             Box::new(MemoryStore::new()),
@@ -4090,6 +4380,8 @@ mod tests {
             assert_eq!(corrected.original_score, Some(2));
             assert_eq!(corrected.final_score, Some(5));
             assert_eq!(store.list_disputes_for_grade(saved.id).unwrap().len(), 1);
+            // The listed row carries the same undisputed-then-disputed state.
+            assert!(store.list_grades_for_question(question_id).unwrap()[0].disputed);
             // Re-dispute preserves the FIRST original, not the intermediate.
             let mut second = sample_dispute(saved.id);
             second.decision = "UPHELD".to_string();

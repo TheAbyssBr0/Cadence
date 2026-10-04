@@ -727,6 +727,38 @@ mod tests {
     }
 
     #[test]
+    fn boundary_counts_accepted() {
+        // Exactly MAX_PARTS parts is valid; one more is not.
+        let mut full = good_set();
+        full["questions"][1]["parts"] =
+            serde_json::json!(["a) One.", "b) Two.", "c) Three.", "d) Four.", "e) Five."]);
+        assert!(validate_assignment_set(&full.to_string(), &unit(), &open()).is_ok());
+        let mut over = good_set();
+        over["questions"][1]["parts"] = serde_json::json!([
+            "a) One.",
+            "b) Two.",
+            "c) Three.",
+            "d) Four.",
+            "e) Five.",
+            "f) Six."
+        ]);
+        assert!(validate_assignment_set(&over.to_string(), &unit(), &open()).is_err());
+        // A solution of exactly MIN_SOLUTION_CHARS is substantial, not a stub.
+        let mut exact = good_set();
+        exact["questions"][0]["rubric"]["model_solution"] =
+            serde_json::json!("12345678901234567890");
+        assert_eq!(
+            exact["questions"][0]["rubric"]["model_solution"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .count(),
+            MIN_SOLUTION_CHARS
+        );
+        assert!(validate_assignment_set(&exact.to_string(), &unit(), &open()).is_ok());
+    }
+
+    #[test]
     fn single_part_written_fails() {
         let mut set = good_set();
         set["questions"][1]["parts"] = serde_json::json!(["a) Only one part here."]);

@@ -221,6 +221,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_pdf() -> PathBuf {
+        // Explicit override first (mutation runs build in scratch copies
+        // outside the checkout, so the parent-dir convention cannot work
+        // there); otherwise the untracked book beside the checkout.
+        if let Some(path) = std::env::var_os("CADENCE_FIXTURE_PDF") {
+            return PathBuf::from(path);
+        }
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.pop();
         p.push("Modern C.pdf");
@@ -276,6 +282,8 @@ mod tests {
         let from_18 = source.outline(18).unwrap();
         assert!(from_18.iter().all(|b| b.page >= 18));
         assert!(from_18.len() < all.len());
+        // Entries exactly on the start page are included, not skipped.
+        assert!(from_18.iter().any(|b| b.page == 18));
         let chapter_one = from_18
             .iter()
             .find(|b| b.heading == "1 Getting started")
@@ -317,6 +325,8 @@ mod tests {
         assert!(source.text_for_range(0, 5).is_err());
         assert!(source.text_for_range(10, 5).is_err());
         assert!(source.text_for_range(400, 409).is_err());
+        // The last page itself is a valid range end.
+        assert!(source.text_for_range(408, 408).is_ok());
     }
 
     #[test]

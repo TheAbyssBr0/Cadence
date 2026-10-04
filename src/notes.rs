@@ -390,6 +390,18 @@ mod tests {
     }
 
     #[test]
+    fn prompt_guides_on_partial_evidence() {
+        // Either evidence kind alone steers emphasis (the "none" branch
+        // needs both empty).
+        let prompt = build_notes_prompt(&unit(), &misconceptions(), &[]);
+        assert!(prompt.contains("Linger on these topics"));
+        assert!(!prompt.contains("no assessment evidence"));
+        let prompt = build_notes_prompt(&unit(), &[], &grades());
+        assert!(prompt.contains("Linger on these topics"));
+        assert!(!prompt.contains("no assessment evidence"));
+    }
+
+    #[test]
     fn prompt_forbids_meta_language() {
         let prompt = build_notes_prompt(&unit(), &misconceptions(), &grades());
         assert!(prompt.contains("never cite takeaway numbers"));
@@ -460,6 +472,21 @@ mod tests {
         doc.push_str(&"Padding to clear the stub floor. ".repeat(20));
         let response = serde_json::json!({"notes_markdown": doc}).to_string();
         assert!(validate_notes(&response).is_err());
+    }
+
+    #[test]
+    fn boundary_length_accepted() {
+        // Exactly MIN_NOTES_CHARS with enough sections is substantial.
+        let header = "## Alpha\n## Beta\n## Gamma\n";
+        let filler: String = "Chapter substance. "
+            .chars()
+            .cycle()
+            .take(MIN_NOTES_CHARS - header.chars().count())
+            .collect();
+        let markdown = format!("{header}{filler}");
+        assert_eq!(markdown.chars().count(), MIN_NOTES_CHARS);
+        let response = serde_json::json!({"notes_markdown": markdown}).to_string();
+        assert!(validate_notes(&response).is_ok());
     }
 
     #[test]

@@ -1481,6 +1481,240 @@ mod tests {
     }
 
     #[test]
+    fn spinner_frames_rotate_without_panicking() {
+        assert_eq!(spinner_frame_at(0), "⠋");
+        assert_eq!(spinner_frame_at(3), "⠸");
+        assert_eq!(spinner_frame_at(10), "⠋");
+        assert_eq!(spinner_frame_at(11), "⠙");
+        assert_eq!(spinner_frame_at(usize::MAX), "⠴");
+    }
+
+    #[test]
+    fn spinner_start_is_inactive_without_terminal() {
+        // The harness captures stderr (not a terminal), so no thread spawns.
+        assert!(!LlmSpinner::start("probe".to_string()).is_active());
+        assert!(!LlmSpinner::inactive().is_active());
+    }
+
+    #[test]
+    fn spinner_guard_reports_active_handle() {
+        let handle = std::thread::spawn(|| {});
+        let guard = LlmSpinner {
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: Some(handle),
+            message: None,
+            started: Instant::now(),
+        };
+        assert!(guard.is_active());
+        // Drop joins the finished thread without hanging.
+    }
+
+    #[test]
+    fn envelope_helpers_extract() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}]
+        });
+        assert_eq!(
+            HttpLlmProvider::assistant_text(&body).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            HttpLlmProvider::assistant_text(&serde_json::json!({})),
+            None
+        );
+        let err_body = serde_json::json!({"error": {"message": "nope"}});
+        assert_eq!(
+            HttpLlmProvider::provider_message(&err_body).as_deref(),
+            Some("nope")
+        );
+        assert_eq!(
+            HttpLlmProvider::provider_message(&serde_json::json!({})),
+            None
+        );
+        assert_eq!(HttpLlmProvider::clipped("abc"), "abc");
+        assert_eq!(HttpLlmProvider::clipped(&"y".repeat(600)).len(), 500);
+        let stop = HttpLlmProvider::stop_info_of(&body);
+        assert_eq!(stop.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(stop.eos_reason, None);
+    }
+
+    #[test]
+    fn request_json_is_canonical() {
+        assert_eq!(
+            request_json("p", "{}").unwrap(),
+            r#"{"params":"{}","prompt":"p"}"#.to_string()
+        );
+    }
+
+    #[test]
+    fn unset_env_keys_read_empty() {
+        // Absent from the process env and any dotenv file alike.
+        assert_eq!(
+            LlmConfig::value_from_env("CADENCE_TEST_UNSET_KEY_9ZQ"),
+            String::new()
+        );
+        assert_eq!(
+            LlmConfig::key_from_env("CADENCE_TEST_UNSET_KEY_9ZQ"),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn dotenv_key_reads_explicit_file() {
+        let dir = std::env::temp_dir().join(format!("cadence-dotenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(&path, "PRESENT=here\n# COMMENTED=out\n").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(dotenv_key(&path, "PRESENT").as_deref(), Some("here"));
+        assert_eq!(dotenv_key(&path, "COMMENTED"), None);
+        assert_eq!(dotenv_key(&path, "MISSING"), None);
+        assert_eq!(dotenv_key("/nonexistent-dir-xyz/.env", "PRESENT"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fail_job_reports_missing_rows() {
+        let mut store = MemoryStore::new();
+        let job = store
+            .create_llm_job(&NewLlmJob {
+                operation: "smoke".to_string(),
+                provider: "custom".to_string(),
+                model: "m".to_string(),
+                input_hash: "abc".to_string(),
+                prompt_version: "v1".to_string(),
+            })
+            .unwrap();
+        fail_job(&mut store, job.id, 1, "boom", Some("raw")).unwrap();
+        assert!(matches!(
+            fail_job(&mut store, job.id + 999, 1, "boom", None).unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    /// Serve canned HTTP responses on loopback; returns the base URL.
+    fn serve_seq(responses: Vec<(u16, String)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                // Drain the full request (headers plus any body) first:
+                // responding (and closing) unread races the client's send
+                // and surfaces as a send error.
+                let mut drain = Vec::new();
+                let mut byte = [0_u8; 1];
+                let mut body_len = 0_usize;
+                let mut headers_done = false;
+                while let Ok(n) = stream.read(&mut byte) {
+                    if n == 0 {
+                        break;
+                    }
+                    drain.extend_from_slice(&byte[..n]);
+                    if !headers_done {
+                        if !drain.ends_with(b"\r\n\r\n") {
+                            continue;
+                        }
+                        headers_done = true;
+                        let head = String::from_utf8_lossy(&drain);
+                        body_len = head
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        drain.clear();
+                    }
+                    if drain.len() >= body_len {
+                        break;
+                    }
+                }
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    429 => "Too Many Requests",
+                    _ => "Error",
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn provider_for(url: &str) -> HttpLlmProvider {
+        let mut config = config_for("custom");
+        config.endpoint = url.to_string();
+        HttpLlmProvider::new(config).unwrap()
+    }
+
+    #[test]
+    fn check_api_classifies_statuses() {
+        let ok = provider_for(&serve_seq(vec![(200, "{}".to_string())]));
+        assert!(ok.check_api().is_ok());
+        let limited = provider_for(&serve_seq(vec![(429, "{}".to_string())]));
+        assert!(matches!(
+            limited.check_api().unwrap_err(),
+            Error::LlmTransient(_)
+        ));
+        let bad = provider_for(&serve_seq(vec![(
+            400,
+            r#"{"error":{"message":"nope"}}"#.to_string(),
+        )]));
+        let err = bad.check_api().unwrap_err();
+        assert!(matches!(err, Error::LlmFatal(_)));
+        assert!(err.to_string().contains("400"));
+        // Closed port: connect failure is transient, not fatal.
+        let shut = provider_for("http://127.0.0.1:1");
+        assert!(matches!(
+            shut.check_api().unwrap_err(),
+            Error::LlmTransient(_)
+        ));
+    }
+
+    #[test]
+    fn send_parses_envelope_and_tracks_stop_info() {
+        let envelope = serde_json::json!({
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}]
+        })
+        .to_string();
+        let provider = provider_for(&serve_seq(vec![(200, envelope)]));
+        assert_eq!(provider.provider_id(), "custom");
+        assert_eq!(provider.model_id(), GEMINI_DEFAULT_MODEL);
+        assert!(provider.last_stop_info().is_none());
+        match provider.send("hi") {
+            ProviderOutcome::Ok(text) => assert_eq!(text, "hello"),
+            ProviderOutcome::Retryable { message, .. } => panic!("retryable: {message}"),
+            ProviderOutcome::Fatal(message) => panic!("fatal: {message}"),
+        }
+        let stop = provider.last_stop_info().unwrap();
+        assert_eq!(stop.finish_reason.as_deref(), Some("stop"));
+        // Provider error bodies surface their message; long ones clip.
+        let err_provider = provider_for(&serve_seq(vec![(
+            400,
+            r#"{"error":{"message":"nope"}}"#.to_string(),
+        )]));
+        match err_provider.send("hi") {
+            ProviderOutcome::Fatal(message) => assert!(message.contains("nope")),
+            _ => panic!("expected fatal"),
+        }
+        // Closed port surfaces a retryable transport outcome.
+        let shut = provider_for("http://127.0.0.1:1");
+        assert!(matches!(shut.send("hi"), ProviderOutcome::Retryable { .. }));
+    }
+
+    #[test]
     fn response_format_envelope_is_strict() {
         let envelope = response_format_envelope("{\"type\":\"object\"}", "probe");
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();

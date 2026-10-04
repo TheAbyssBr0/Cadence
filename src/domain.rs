@@ -404,7 +404,9 @@ mod tests {
         assert!(validate_book_registration(1).is_ok());
         assert!(validate_page_range(10, 5).is_err());
         assert!(validate_page_range(0, 5).is_err());
+        assert!(validate_page_range(5, 0).is_err());
         assert!(validate_page_range(5, 5).is_ok());
+        assert!(validate_page_range(1, 1).is_ok());
     }
 
     #[test]
@@ -438,6 +440,8 @@ mod tests {
         assert!(likely_meta("Index", 1, 20));
         assert!(likely_meta("Bibliography", 2, 30));
         assert!(likely_meta("Level 1 Acquaintance", 1, 6));
+        assert!(likely_meta("Level 1 Preface", 3, 10));
+        assert!(!likely_meta("Level 1 Sprawling", 1, 11));
         assert!(likely_meta("Short intro", 1, 5));
         assert!(!likely_meta("Pointers and memory", 2, 30));
         assert!(!likely_meta("Ownership", 1, 40));

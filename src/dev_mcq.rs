@@ -397,6 +397,32 @@ mod tests {
     }
 
     #[test]
+    fn answered_tracks_recorded_responses() {
+        let mut store = crate::store::MemoryStore::new();
+        let chapter = ensure_dev_chapter(&mut store, "hash1", "ch.pdf", &unit()).unwrap();
+        let saved = store
+            .save_mcq_items(&[crate::store::NewMcqItem {
+                chapter_id: chapter.id,
+                phase: "pretest".to_string(),
+                question_text: "What does &x yield?".to_string(),
+                options_json: "[\"a\", \"b\", \"c\", \"d\"]".to_string(),
+                correct_index: 0,
+                trap_index: 1,
+                explanation_text: "It yields the address.".to_string(),
+                source_refs: "{}".to_string(),
+                topic: "addresses".to_string(),
+                attempt_no: 1,
+            }])
+            .unwrap();
+        assert!(!is_answered(&store, saved[0].id).unwrap());
+        store
+            .record_mcq_response(saved[0].id, 0, true, false, "2026-09-20", 1)
+            .unwrap();
+        assert!(is_answered(&store, saved[0].id).unwrap());
+        assert!(!is_answered(&store, saved[0].id + 99).unwrap());
+    }
+
+    #[test]
     fn dev_chapter_reuses_matching_pages() {
         let mut store = crate::store::MemoryStore::new();
         let u = unit();

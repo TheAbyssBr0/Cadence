@@ -351,6 +351,13 @@ mod tests {
     }
 
     #[test]
+    fn boundary_scores_accepted() {
+        // Zero is a valid revised score, not "negative".
+        let zeroed = validate_dispute(&audit(true, 0, "REVISED").to_string(), 5, 2).unwrap();
+        assert_eq!(zeroed.final_score, 0);
+    }
+
+    #[test]
     fn verdict_score_consistency_gates() {
         // Valid flag with UPHELD action contradicts itself.
         assert!(validate_dispute(&audit(true, 2, "UPHELD").to_string(), 5, 2).is_err());
@@ -401,6 +408,17 @@ mod tests {
         let bare = build_dispute_prompt("", &rubric(), "No.", "INCORRECT 0/5.", "Wrong.", None);
         assert!(bare.contains("No question text supplied"));
         assert!(bare.contains("No chapter source excerpt was supplied"));
+        // Whitespace-only excerpts count as absent, not as source.
+        let blank_excerpt = build_dispute_prompt(
+            "Can one lea emit 5*x+y+12?",
+            &rubric(),
+            "No.",
+            "INCORRECT 0/5.",
+            "Wrong.",
+            Some("   "),
+        );
+        assert!(blank_excerpt.contains("No chapter source excerpt was supplied"));
+        assert!(!blank_excerpt.contains("CHAPTER SOURCE"));
     }
 
     #[test]
