@@ -1,0 +1,26 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Mirrors scripts/check.sh from the project wrapper (the wrapper itself
+      # is untracked scaffolding and never pushed; the crate IS the repo).
+      # Toolchain date must match rust-toolchain.toml.
+      - name: Install pinned nightly
+        run: rustup toolchain install nightly-2026-09-07 --component clippy,rustfmt --profile minimal
+      - name: fmt
+        run: cargo +nightly-2026-09-07 fmt --all --check
+      - name: clippy
+        run: cargo +nightly-2026-09-07 clippy --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo +nightly-2026-09-07 test --all-features
+      - name: supply-chain audit
+        run: |
+          cargo install --locked cargo-deny
+          cargo +nightly-2026-09-07 deny check

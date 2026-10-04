@@ -2,6 +2,7 @@
 name = "cadence"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -64,3 +65,6 @@ debug = "line-tables-only"
 [profile.checked]        # release speed with every debug_assert! on: cargo run --profile checked
 inherits = "release"
 debug-assertions = true
+
+[dev-dependencies]
+proptest = "1.11.0"
