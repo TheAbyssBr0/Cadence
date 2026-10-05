@@ -51,7 +51,11 @@ export AR_x86_64_unknown_linux_musl="$AR_BIN"
 # Size over speed: this app is LLM- and I/O-bound, so optimize for a small
 # portable binary. Rust side only; the C/C++ deps (MuPDF, SQLite) follow
 # CFLAGS below (appended after cc-crate defaults, so -Os wins).
+# DEBUG=false: our release profile keeps line tables for benchmark fidelity,
+# but the portable binary ships without them (saves ~30MB; matches the old
+# learning-app/cadence artifact, which had no debug info).
 export CARGO_PROFILE_RELEASE_OPT_LEVEL="s"
+export CARGO_PROFILE_RELEASE_DEBUG="false"
 export CFLAGS_x86_64_unknown_linux_musl="-Os"
 export CXXFLAGS_x86_64_unknown_linux_musl="-Os"
 
