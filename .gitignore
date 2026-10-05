@@ -1,4 +1,5 @@
 /target
 /scratch
+/.scratch/
 .env
 /mutants.out*
