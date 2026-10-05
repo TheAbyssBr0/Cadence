@@ -613,6 +613,307 @@ mod tests {
     }
 
     #[test]
+    fn grouped_entries_validates_bounds() {
+        let ok = vec![boundary("Ch 1", 20, 2)];
+        assert!(grouped_entries(&ok, 20, 35, 50).is_ok());
+        // Edges are inclusive.
+        assert!(grouped_entries(&ok, 20, 20, 50).is_ok());
+        // Outside either edge fails.
+        let low = vec![boundary("Ch 1", 19, 2)];
+        assert!(grouped_entries(&low, 20, 35, 50).is_err());
+        let high = vec![boundary("Ch 1", 36, 2)];
+        assert!(grouped_entries(&high, 20, 35, 50).is_err());
+        // Degenerate inputs fail loudly.
+        assert!(grouped_entries(&ok, 20, 35, 0).is_err());
+        assert!(grouped_entries(&ok, 0, 35, 50).is_err());
+        assert!(grouped_entries(&ok, 20, 10, 50).is_err());
+        assert!(grouped_entries(&[], 20, 35, 50).is_err());
+        // Levels start at 1.
+        let flat = vec![boundary("X", 20, 0)];
+        assert!(grouped_entries(&flat, 20, 35, 50).is_err());
+        // Ones are valid minima, not violations.
+        let one = vec![boundary("Only", 1, 1)];
+        assert!(grouped_entries(&one, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn explicit_level_one_accepted() {
+        let bounds = vec![boundary("Part", 20, 1), boundary("Ch", 22, 2)];
+        let units = plan_units_at_level(&bounds, 20, 35, 50, Some(1)).unwrap();
+        assert_ne!(units.len(), 0);
+    }
+
+    #[test]
+    fn grouped_entries_merges_same_page_by_shallowest() {
+        // Unsorted input sorts by page; same-page duplicates keep the
+        // shallowest opener (first on ties).
+        let bounds = vec![
+            boundary("Mid", 25, 2),
+            boundary("Deep", 22, 3),
+            boundary("Shallow", 22, 1),
+            boundary("Tie A", 30, 2),
+            boundary("Tie B", 30, 2),
+        ];
+        let grouped = grouped_entries(&bounds, 20, 35, 50).unwrap();
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].page, 22);
+        assert_eq!(grouped[0].heading, "Shallow");
+        assert_eq!(grouped[1].page, 25);
+        assert_eq!(grouped[2].heading, "Tie A");
+    }
+
+    #[test]
+    fn chapter_level_detection_uses_median_span() {
+        // Four spans [5, 5, 50, 140]: the median (index len/2) qualifies.
+        let bounds = vec![
+            boundary("A", 1, 2),
+            boundary("B", 6, 2),
+            boundary("C", 11, 2),
+            boundary("D", 61, 2),
+        ];
+        assert_eq!(detect_chapter_level(&bounds, 200), Some(2));
+        // Nothing chapter-sized: no detection.
+        let small = vec![boundary("A", 1, 3), boundary("B", 3, 3)];
+        assert_eq!(detect_chapter_level(&small, 5), None);
+        assert_eq!(sorted_levels(&[]), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn describe_levels_skips_invalid_entries() {
+        let bounds = vec![
+            boundary("Meta", 5, 0),
+            boundary("Early", 10, 2),
+            boundary("Ch 1", 20, 2),
+        ];
+        let text = describe_levels(&bounds, 20, 35, None);
+        assert!(text.contains("level 2: 1 entry"));
+        assert!(!text.contains("Meta"));
+        assert!(!text.contains("Early"));
+    }
+
+    fn entry(heading: &str, level: i64, page: i64) -> Entry {
+        Entry {
+            heading: heading.to_string(),
+            level,
+            page,
+        }
+    }
+
+    #[test]
+    fn split_span_tiles_fits_and_splits() {
+        // Fits the cap: one unit.
+        let mut out = Vec::new();
+        split_span(&[entry("H", 2, 20)], 20, 40, 50, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].start_page, out[0].end_page), (20, 40));
+        // Exactly at the cap still fits.
+        let mut out = Vec::new();
+        split_span(&[entry("H", 2, 20)], 20, 34, 15, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        // Oversized with subchapters splits at child level.
+        let mut out = Vec::new();
+        split_span(
+            &[entry("H", 2, 20), entry("S1", 3, 30), entry("S2", 3, 40)],
+            20,
+            60,
+            25,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!((out[0].start_page, out[0].end_page), (20, 29));
+        assert_eq!((out[1].start_page, out[1].end_page), (30, 39));
+        assert_eq!((out[2].start_page, out[2].end_page), (40, 60));
+        // Oversized without subchapters needs manual boundaries.
+        let mut out = Vec::new();
+        assert!(split_span(&[entry("H", 2, 20)], 20, 60, 15, &mut out).is_err());
+        // Empty span fails loudly.
+        let mut out = Vec::new();
+        assert!(split_span(&[], 20, 40, 50, &mut out).is_err());
+    }
+
+    #[test]
+    fn push_span_opens_past_start_spans() {
+        // A head past the span start opens at the span start; the rest
+        // tiles at child level.
+        let entries = vec![entry("H", 2, 30), entry("S", 3, 40), entry("T", 3, 70)];
+        let mut out = Vec::new();
+        push_span_units(&entries, 25, 100, false, 35, &mut out).unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!((out[0].start_page, out[0].end_page), (25, 29));
+        assert_eq!(out[0].heading, "H");
+        assert_eq!((out[3].start_page, out[3].end_page), (70, 100));
+        assert_eq!(out[3].heading, "T");
+    }
+
+    #[test]
+    fn split_span_two_point_split_succeeds() {
+        // Exactly two sub-span openers is a valid split, not an error.
+        let mut out = Vec::new();
+        split_span(
+            &[entry("H", 2, 20), entry("S", 3, 30)],
+            20,
+            60,
+            35,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].start_page, out[0].end_page), (20, 29));
+        assert_eq!((out[1].start_page, out[1].end_page), (30, 60));
+    }
+
+    #[test]
+    fn split_span_child_level_selects_openers() {
+        // A same-level entry joins the child level; other levels do not
+        // open sub-spans.
+        let mut out = Vec::new();
+        split_span(
+            &[entry("H", 2, 20), entry("S", 3, 30), entry("X", 2, 40)],
+            20,
+            60,
+            35,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        // A deeper level never opens when a shallower child exists.
+        let mut out = Vec::new();
+        split_span(
+            &[entry("H", 2, 20), entry("S", 3, 30), entry("X", 4, 40)],
+            20,
+            60,
+            35,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn split_span_ignores_on_start_children() {
+        // An entry exactly on the span start is the head's peer, not a
+        // sub-span opener: the first unit keeps the head's heading.
+        let mut out = Vec::new();
+        split_span(
+            &[entry("H", 2, 20), entry("S", 3, 20), entry("T", 3, 30)],
+            20,
+            60,
+            35,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].heading, "H");
+    }
+
+    #[test]
+    fn split_span_single_page_sub_span_counts() {
+        let mut out = Vec::new();
+        split_span(
+            &[entry("H", 2, 20), entry("S", 3, 21)],
+            20,
+            60,
+            40,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].start_page, out[0].end_page), (20, 20));
+        assert_eq!((out[1].start_page, out[1].end_page), (21, 60));
+    }
+
+    #[test]
+    fn split_span_errors_name_the_missing_piece() {
+        // No in-span deeper level: subchapter boundaries are missing.
+        let mut out = Vec::new();
+        let err = split_span(&[entry("H", 2, 20)], 20, 60, 15, &mut out).unwrap_err();
+        assert!(err.to_string().contains("no subchapter boundaries"));
+        // Out-of-span entries do not count as deeper levels either.
+        let mut out = Vec::new();
+        let err = split_span(
+            &[entry("H", 2, 20), entry("X", 5, 10)],
+            20,
+            60,
+            15,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no subchapter boundaries"));
+    }
+
+    #[test]
+    fn split_span_on_start_entries_open_no_span() {
+        // An on-start non-head entry covers its sub-span under its own
+        // heading (the pre-span head does not leak into the span).
+        let mut out = Vec::new();
+        split_span(
+            &[entry("Q", 2, 15), entry("P", 3, 20), entry("R", 3, 30)],
+            20,
+            60,
+            35,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].heading, "P");
+        assert_eq!((out[0].start_page, out[0].end_page), (20, 29));
+        assert_eq!(out[1].heading, "R");
+    }
+
+    #[test]
+    fn split_span_on_start_entries_are_not_deeper() {
+        // An entry exactly on the span start cannot open a sub-span: the
+        // deeper search looks strictly past it.
+        let mut out = Vec::new();
+        let err = split_span(
+            &[entry("H", 2, 20), entry("S", 3, 20)],
+            20,
+            60,
+            15,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no subchapter boundaries"));
+    }
+
+    #[test]
+    fn verify_coverage_accepts_exact_tiling_only() {
+        let unit = |start: i64, end: i64| PlannedUnit {
+            heading: "u".to_string(),
+            level: 2,
+            start_page: start,
+            end_page: end,
+        };
+        assert!(verify_coverage(&[unit(20, 29), unit(30, 40)], 20, 40).is_ok());
+        // Empty, late start, gap, inverted, short cover all fail.
+        assert!(verify_coverage(&[], 20, 40).is_err());
+        assert!(verify_coverage(&[unit(21, 40)], 20, 40).is_err());
+        assert!(verify_coverage(&[unit(20, 29), unit(31, 40)], 20, 40).is_err());
+        assert!(verify_coverage(&[unit(20, 19)], 20, 40).is_err());
+        assert!(verify_coverage(&[unit(20, 39)], 20, 40).is_err());
+    }
+
+    #[test]
+    fn manual_boundaries_require_exact_cover() {
+        // Exact cover parses; edges are inclusive.
+        let units = parse_manual_boundaries("20-29,30-40", 20, 40, "Ch", 2).unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(parse_manual_boundaries("20-40", 20, 40, "Ch", 2).is_ok());
+        // Each bound violation fails at the bounds check (not a later one).
+        let err = parse_manual_boundaries("19-40", 20, 40, "Ch", 2).unwrap_err();
+        assert!(err.to_string().contains("outside"));
+        let err = parse_manual_boundaries("20-41", 20, 40, "Ch", 2).unwrap_err();
+        assert!(err.to_string().contains("outside"));
+        assert!(parse_manual_boundaries("25-24", 20, 40, "Ch", 2).is_err());
+        assert!(parse_manual_boundaries("20-29,31-40", 20, 40, "Ch", 2).is_err());
+        assert!(parse_manual_boundaries("", 20, 40, "Ch", 2).is_err());
+        assert!(parse_manual_boundaries("20-40,30-50", 20, 40, "Ch", 2).is_err());
+        // Single-page ranges are valid boundaries, not inversions.
+        assert!(parse_manual_boundaries("25-25", 25, 25, "Ch", 2).is_ok());
+    }
+
+    #[test]
     fn small_book_stays_whole() {
         let bounds = vec![boundary("Ch 1", 20, 2), boundary("Ch 2", 28, 2)];
         let units = plan_units(&bounds, 20, 35, 50).unwrap();

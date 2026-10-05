@@ -191,17 +191,23 @@ pub fn ensure_dev_chapter(
         && book.file_hash == pdf_hash
     {
         let chapters = store.list_chapters(book.id)?;
-        for chapter in &chapters {
+        let mut first = None;
+        let mut chapter_count: usize = 0;
+        for chapter in chapters {
+            chapter_count = chapter_count.saturating_add(1);
             if chapter.start_page == unit.page_start && chapter.end_page == unit.page_end {
-                return Ok(chapter.clone());
+                return Ok(chapter);
+            }
+            if first.is_none() {
+                first = Some(chapter);
             }
         }
-        if let Some(first) = chapters.first() {
-            return Ok(first.clone());
+        if let Some(chapter) = first {
+            return Ok(chapter);
         }
         return store.create_chapter(&NewChapter {
             book_id: book.id,
-            index_in_book: i64::try_from(chapters.len()).unwrap_or(0),
+            index_in_book: i64::try_from(chapter_count).unwrap_or(0),
             level: 1,
             title: unit.heading.clone(),
             start_page: unit.page_start,

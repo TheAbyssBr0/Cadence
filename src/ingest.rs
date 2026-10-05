@@ -231,8 +231,7 @@ pub fn store_units(
         let Some(number) = index.checked_add(1) else {
             return Err(Error::Io("too many units".to_string()));
         };
-        let mut path = dir.clone();
-        path.push(format!("unit_{number}.json"));
+        let path = dir.join(format!("unit_{number}.json"));
         let payload = UnitPayload {
             heading: unit.heading.clone(),
             level: unit.level,

@@ -1176,7 +1176,7 @@ fn run_daily_loop(store: &mut SqliteStore, today: NaiveDate, today_str: &str) ->
             print_day_complete(store, today)?;
             return Ok(());
         };
-        let task = head.clone();
+        let task = head;
         // Pre-chapter gate (§4.1): fresh pretests offer proceed/skip/exit.
         if task.task_type == TaskType::Pretest {
             let chapter = store.get_chapter(task.chapter_id)?;
@@ -1195,7 +1195,7 @@ fn run_daily_loop(store: &mut SqliteStore, today: NaiveDate, today_str: &str) ->
             TaskType::Pretest | TaskType::Retest => {
                 run_production_mcq(store, task.id, today, today_str)?
             }
-            TaskType::Read => run_reading_task(store, &task, today_str)?,
+            TaskType::Read => run_reading_task(store, task, today_str)?,
             TaskType::AssignmentWrite => {
                 run_production_assignment(store, task.id, today, today_str)?
             }
@@ -1996,7 +1996,7 @@ fn collect_review_views(store: &SqliteStore) -> Result<Vec<review::ChapterOpen>>
             }
             views.push(review::ChapterOpen {
                 chapter_id: chapter.id,
-                title: chapter.title.clone(),
+                title: chapter.title,
                 status: chapter.status,
                 rows,
             });
@@ -2217,8 +2217,7 @@ fn guard_single_book(store: &mut dyn Store, config: &Config, new_title: &str) ->
         return Ok(false);
     }
     store.clear_library()?;
-    let mut books_dir = config.data_dir.clone();
-    books_dir.push("books");
+    let books_dir = config.data_dir.join("books");
     if books_dir.exists() {
         std::fs::remove_dir_all(&books_dir)?;
     }
@@ -2295,9 +2294,9 @@ fn run_ingest(
     let book = ingest::register_book(
         &mut store,
         &store::NewBook {
-            title: resolved_title.clone(),
+            title: resolved_title,
             filepath: pdf_path.to_string_lossy().into_owned(),
-            file_hash: hash.clone(),
+            file_hash: hash,
             start_page,
         },
         &units,
@@ -2307,9 +2306,11 @@ fn run_ingest(
     let ingest_day = today_date();
     let topped = ensure_tasks(&mut store, book.id, ingest_day, &today)?.len();
     println!(
-        "ingested book {} ({resolved_title}): {} unit(s), hash {hash} ({topped} initial task(s) scheduled)",
+        "ingested book {} ({}): {} unit(s), hash {} ({topped} initial task(s) scheduled)",
         book.id,
-        units.len()
+        book.title,
+        units.len(),
+        book.file_hash
     );
     for (index, unit) in units.iter().enumerate() {
         let Some(number) = index.checked_add(1) else {
@@ -2417,8 +2418,10 @@ fn run_dev_llm(operation: &str, prompt: Option<&str>, model: Option<&str>) -> Re
     let db_path = std::path::PathBuf::from(".scratch/dev-llm/cadence.db");
     let lock_path = std::path::PathBuf::from(".scratch/dev-llm/cadence.lock");
     let mut store = SqliteStore::open(&db_path, &lock_path)?;
-    let provider = llm::HttpLlmProvider::new(config.clone())?;
-    let params = format!("{{\"max_tokens\":{}}}", config.max_tokens);
+    let max_tokens = config.max_tokens;
+    let model = config.model.clone();
+    let provider = llm::HttpLlmProvider::new(config)?;
+    let params = format!("{{\"max_tokens\":{max_tokens}}}");
     let today = today_date().format("%Y-%m-%d").to_string();
     let hooks = llm::RunHooks {
         sleep: &std::thread::sleep,
@@ -2436,7 +2439,7 @@ fn run_dev_llm(operation: &str, prompt: Option<&str>, model: Option<&str>) -> Re
         &llm::validate_smoke,
         &hooks,
     )?;
-    println!("model: {}", config.model);
+    println!("model: {model}");
     println!("cache: {}", if result.cache_hit { "hit" } else { "miss" });
     println!("transport sends: {}", result.transport_calls);
     println!("--- response ---\n{}", result.text);
@@ -2536,9 +2539,11 @@ fn run_dev_mcq(
     use std::path::Path;
     let phase = mcq::McqPhase::parse(phase_label)?;
     let first = extract_first_unit(pdf_path, start_page)?;
-    let unit = first.unit;
-    let pdf_hash = first.pdf_hash.clone();
-    let pdf_name = first.pdf_name;
+    let FirstUnit {
+        unit,
+        pdf_hash,
+        pdf_name,
+    } = first;
     let count = dev_mcq::DEV_MCQ_COUNT;
     let prompt = match phase {
         mcq::McqPhase::Pretest => mcq::build_pretest_prompt(&unit, count),
@@ -3083,17 +3088,17 @@ fn load_dispute_case(
         )));
     }
     let total = questions.len();
-    let selected = questions.get(position).ok_or_else(|| {
+    let selected = questions.into_iter().nth(position).ok_or_else(|| {
         Error::InvalidInput(format!("question {question_no} out of range (1-{total})"))
     })?;
     let responses = store.list_assignment_responses(selected.id)?;
-    let answer = responses.last().ok_or_else(|| {
+    let answer = responses.into_iter().last().ok_or_else(|| {
         Error::InvalidInput(format!(
             "question {question_no} has no recorded answer yet — answer it first"
         ))
     })?;
     let grades = store.list_grades_for_question(selected.id)?;
-    let grade = grades.last().cloned().ok_or_else(|| {
+    let grade = grades.into_iter().last().ok_or_else(|| {
         Error::InvalidInput(format!(
             "question {question_no} has no recorded grade yet — grade it first"
         ))
@@ -3108,13 +3113,14 @@ fn load_dispute_case(
                 .take(dispute::SOURCE_EXCERPT_CHARS)
                 .collect::<String>()
         });
+    let rubric_json = selected.rubric_json.clone();
     Ok(DisputeCase {
         chapter_id: chapter.id,
-        question: selected.clone(),
+        question: selected,
         question_text: parts.join("\n"),
-        rubric_json: selected.rubric_json.clone(),
+        rubric_json,
         rubric,
-        answer: answer.answer_text.clone(),
+        answer: answer.answer_text,
         grade_summary: format!(
             "classification={} score={}/{} feedback={}",
             grade.classification, grade.score, grade.max_score, grade.feedback
@@ -4854,6 +4860,7 @@ mod tests {
         let rows = store.list_misconceptions(chapter_id).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].evidence.contains("trap selected"));
+        assert!(rows[0].evidence.contains("The value of x"));
         let responses = store.list_mcq_responses(item.id).unwrap();
         assert_eq!(responses.len(), 1);
         assert!(responses[0].selected_trap);
@@ -4885,6 +4892,8 @@ mod tests {
         assert_eq!(rows[0].status, "ACTIVE");
         assert!((rows[0].confidence - 0.5).abs() < 1e-9);
         assert!(rows[0].evidence.contains("non-trap wrong answer"));
+        assert!(rows[0].evidence.contains("A null pointer"));
+        assert!(!rows[0].evidence.contains("I don\'t know"));
         let responses = store.list_mcq_responses(item.id).unwrap();
         assert_eq!(responses.len(), 1);
         assert!(!responses[0].selected_trap);
@@ -5231,6 +5240,77 @@ mod tests {
     }
 
     #[test]
+    fn prompt_helpers_parse_and_gate() {
+        // Pure answer parsing: only explicit y/yes chains.
+        assert!(parse_continue_answer("y"));
+        assert!(parse_continue_answer("YES"));
+        assert!(!parse_continue_answer(""));
+        assert!(!parse_continue_answer("n"));
+        assert!(!parse_continue_answer("nope"));
+        // Non-terminal harness: ask fns take their scripted arms.
+        assert!(ask_continue("go?").unwrap());
+        assert!(ask_terminal("go?").unwrap().is_none());
+        assert!(!ask_destructive("sure?").unwrap());
+        assert!(read_manual_from_stdin("leaf").is_err());
+        assert!(read_prompt_from_stdin().is_err());
+    }
+
+    #[test]
+    fn dispute_text_prefers_explicit() {
+        assert_eq!(
+            read_dispute_text(Some("  valid  ")).unwrap(),
+            "valid".to_string()
+        );
+        assert!(read_dispute_text(Some("   ")).is_err());
+        // Piped (non-terminal) stdin here is empty: blank either way.
+        assert!(read_dispute_text(None).is_err());
+    }
+
+    #[test]
+    fn reading_task_pending_without_terminal() {
+        let (mut store, chapter) = sqlite_chapter();
+        let task = store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: chapter.id,
+                task_type: domain::TaskType::Read,
+                scheduled_for: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+                sequence: 1,
+                attempt_no: 1,
+            })
+            .unwrap();
+        // Non-interactive: reading stays pending, no completion.
+        assert!(!run_reading_task(&mut store, &task, "2026-01-10").unwrap());
+        assert_eq!(
+            store.get_task(task.id).unwrap().status,
+            domain::TaskStatus::Pending
+        );
+        // Missing chapters fail loudly.
+        let missing = domain::Task {
+            chapter_id: 9999,
+            ..task
+        };
+        assert!(run_reading_task(&mut store, &missing, "2026-01-10").is_err());
+    }
+
+    #[test]
+    fn skip_unskip_round_trip() {
+        let (mut store, chapter) = sqlite_chapter();
+        run_skip(&mut store, None, "2026-01-10").unwrap();
+        run_skip(&mut store, Some(chapter.id), "2026-01-10").unwrap();
+        assert_eq!(
+            store.get_chapter(chapter.id).unwrap().status,
+            domain::ChapterStatus::Skipped
+        );
+        assert!(run_skip(&mut store, Some(9999), "2026-01-10").is_err());
+        let today = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        run_unskip(&mut store, chapter.id, today, "2026-01-10").unwrap();
+        let reopened = store.get_chapter(chapter.id).unwrap();
+        assert_eq!(reopened.status, domain::ChapterStatus::PretestReady);
+        assert_eq!(reopened.attempt_no, 2);
+    }
+
+    #[test]
     fn skip_listing_flags_meta_and_usage() {
         let (store, _) = sqlite_chapter();
         let text = format_skip_listing(&store).unwrap();
@@ -5293,7 +5373,18 @@ mod tests {
         MetricsReport {
             board,
             overdue,
-            chapters: Vec::new(),
+            chapters: vec![domain::Chapter {
+                id: 7,
+                book_id: 1,
+                index_in_book: 0,
+                level: 1,
+                title: "Pointers".to_string(),
+                start_page: 10,
+                end_page: 20,
+                file_path: "u.json".to_string(),
+                status: domain::ChapterStatus::PretestReady,
+                attempt_no: 1,
+            }],
         }
     }
 
@@ -5312,7 +5403,7 @@ mod tests {
         assert!(text.contains("Skipped: 1 chapter(s)"));
         assert!(text.contains("ETA unknown (no completions in the last 7 days)."));
         assert!(text.contains("Learning debt: 1 overdue task(s):"));
-        assert!(text.contains("[RETEST] 'unknown chapter' (chapter 7, scheduled 2026-01-05)"));
+        assert!(text.contains("[RETEST] 'Pointers' (chapter 7, scheduled 2026-01-05)"));
         // Dated ETA with units left.
         let text = format_metrics(&metric_board(
             Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
@@ -5328,6 +5419,43 @@ mod tests {
             Vec::new(),
         ));
         assert!(text.contains("all units complete."));
+    }
+
+    /// Seed a skipped chapter (with a task) plus an abandoned-attempt task:
+    /// neither counts as live work, and the skip is tallied.
+    fn seed_skipped_and_abandoned(store: &mut SqliteStore, chapter_id: i64, today: NaiveDate) {
+        let skipped = store
+            .create_chapter(&store::NewChapter {
+                book_id: 1,
+                index_in_book: 1,
+                level: 1,
+                title: "Skipped".to_string(),
+                start_page: 21,
+                end_page: 30,
+                file_path: "u2.json".to_string(),
+                status: domain::ChapterStatus::Skipped,
+            })
+            .unwrap();
+        store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: skipped.id,
+                task_type: domain::TaskType::Pretest,
+                scheduled_for: today,
+                sequence: 3,
+                attempt_no: 1,
+            })
+            .unwrap();
+        store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id,
+                task_type: domain::TaskType::Read,
+                scheduled_for: today,
+                sequence: 4,
+                attempt_no: 999,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -5355,13 +5483,28 @@ mod tests {
                 attempt_no: 1,
             })
             .unwrap();
+        store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: chapter.id,
+                task_type: domain::TaskType::Notes,
+                scheduled_for: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+                sequence: 5,
+                attempt_no: 1,
+            })
+            .unwrap();
+        seed_skipped_and_abandoned(&mut store, chapter.id, today);
         let report = collect_metrics(&store, today).unwrap();
         assert_eq!(report.board.tasks_done, 1);
-        assert_eq!(report.board.tasks_total, 2);
-        assert_eq!(report.board.skipped, 0);
+        // The done task's completion date feeds activity (not skipped).
+        assert_eq!(report.board.consistency.days_active, 1);
+        assert_eq!(report.board.tasks_total, 3);
+        assert_eq!(report.board.skipped, 1);
         assert_eq!(report.overdue.len(), 1);
         assert_eq!(report.overdue[0].task_type, domain::TaskType::Read);
-        assert_eq!(report.chapters.len(), 1);
+        assert_eq!(report.chapters.len(), 2);
+        // Evidence covers the live chapter (11 pages), not the skipped one.
+        assert_eq!(report.board.pages_remaining, 11);
     }
 
     /// Fixture PDF beside the checkout (or `CADENCE_FIXTURE_PDF`); `None`
@@ -5424,6 +5567,10 @@ mod tests {
         );
         // A late start keeps the run fast while exercising the full path.
         run_ingest(&pdf, 387, 50, None, None, None, &config).unwrap();
+        // Past the last outline entry the planner (not the range check)
+        // reports the empty plan.
+        let err = run_ingest(&pdf, 408, 50, None, None, None, &config).unwrap_err();
+        assert!(!err.to_string().contains("exceeds document"));
         let store = SqliteStore::open(&config.db_path(), &config.lock_path()).unwrap();
         assert_eq!(store.list_books().unwrap().len(), 1);
         let tasks = store.list_tasks().unwrap();
@@ -5454,7 +5601,8 @@ mod tests {
         // A one-page cap cannot tile automatically: without manual ranges
         // the run fails asking for them (no terminal here); with ranges it
         // succeeds.
-        assert!(run_ingest(&pdf, 387, 1, None, None, None, &config).is_err());
+        let err = run_ingest(&pdf, 387, 1, None, None, None, &config).unwrap_err();
+        assert!(err.to_string().contains("re-run with --manual"));
         run_ingest(&pdf, 387, 1, None, Some("387-408"), None, &config).unwrap();
         let store = SqliteStore::open(&config.db_path(), &config.lock_path()).unwrap();
         assert_eq!(store.list_books().unwrap().len(), 1);
@@ -5578,6 +5726,22 @@ mod tests {
         let before_conf = active.confidence;
         nudge_targeted_misconceptions(&mut store, chapter.id, &[active.id], false, "2026-01-10")
             .unwrap();
+        // IMPROVING rows move too (only resolved/foreign rows skip).
+        let improving = store
+            .create_misconception(chapter.id, "b", "d", "e", "RETEST", "2026-01-10")
+            .unwrap();
+        store
+            .update_misconception(improving.id, 0.5, "IMPROVING", "2026-01-10", None)
+            .unwrap();
+        nudge_targeted_misconceptions(&mut store, chapter.id, &[improving.id], false, "2026-01-10")
+            .unwrap();
+        let moved_improving = store
+            .list_misconceptions(chapter.id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == improving.id)
+            .unwrap();
+        assert!(moved_improving.confidence < 0.5);
         let moved = store
             .list_misconceptions(chapter.id)
             .unwrap()
@@ -5603,13 +5767,24 @@ mod tests {
             )
             .unwrap();
         mem_misconception(&mut store, chapter.id, "other");
+        let improving = mem_misconception(&mut store, chapter.id, "addr");
+        store
+            .update_misconception(improving.id, 0.5, "IMPROVING", "2026-01-10", None)
+            .unwrap();
         assert_eq!(
             boost_matching_misconceptions(&mut store, chapter.id, "addr", "2026-01-10").unwrap(),
-            1
+            2
         );
+        // The improving row moved up; the resolved row was left alone.
+        let rows = store.list_misconceptions(chapter.id).unwrap();
+        let moved = rows.iter().find(|r| r.id == improving.id).unwrap();
+        assert!(moved.confidence > 0.5);
+        let settled = rows.iter().find(|r| r.id == settled.id).unwrap();
+        assert!((settled.confidence - 1.0).abs() < 1e-9);
+        assert_eq!(settled.status, "RESOLVED");
         assert_eq!(
             nudge_matching_misconceptions(&mut store, chapter.id, "addr", "2026-01-10").unwrap(),
-            1
+            2
         );
         assert_eq!(
             nudge_matching_misconceptions(&mut store, chapter.id, "missing", "2026-01-10").unwrap(),
@@ -5764,6 +5939,34 @@ mod tests {
     }
 
     #[test]
+    fn ensure_review_items_resumes_stored() {
+        let (mut store, chapter) = sqlite_chapter();
+        let unit = engines::UnitText {
+            text: "t".to_string(),
+            page_start: 10,
+            page_end: 20,
+            heading: "Pointers".to_string(),
+        };
+        let seeded = store
+            .save_mcq_items(&[store::NewMcqItem {
+                chapter_id: chapter.id,
+                phase: "review".to_string(),
+                question_text: "Q?".to_string(),
+                options_json: "[\"a\",\"b\",\"c\",\"d\"]".to_string(),
+                correct_index: 0,
+                trap_index: 1,
+                explanation_text: "E.".to_string(),
+                source_refs: "{}".to_string(),
+                topic: "t".to_string(),
+                attempt_no: chapter.attempt_no,
+            }])
+            .unwrap();
+        let resumed = ensure_review_items(&mut store, &chapter, &unit, &[], "2026-01-10").unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].id, seeded[0].id);
+    }
+
+    #[test]
     fn guard_single_book_passes_empty_library() {
         let mut store = MemoryStore::new();
         assert!(guard_single_book(&mut store, &Config::default(), "New").unwrap());
@@ -5909,6 +6112,12 @@ mod tests {
         assert!(text.contains("…and 1 more task(s) beyond 2026-01-12."));
         let empty = format_upcoming(&store, &[], today, 2);
         assert!(empty.contains("Nothing scheduled in the next 2 day(s)."));
+        assert!(!empty.contains("more task(s) beyond"));
+        // An on-horizon task is upcoming, never beyond.
+        let edged = vec![on(1, "2026-01-11"), on(2, "2026-01-12")];
+        let edged_text = format_upcoming(&store, &edged, today, 2);
+        assert!(edged_text.contains("2026-01-12:"));
+        assert!(!edged_text.contains("more task(s) beyond"));
     }
 
     #[test]
@@ -6364,6 +6573,29 @@ mod tests {
             .update_misconception(fixed.id, 0.9, "RESOLVED", "2026-09-20", Some("2026-09-20"))
             .unwrap();
 
+        // Decoy tasks (wrong chapter / abandoned attempt) never leak in.
+        let other = store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: chapter.id + 999,
+                task_type: TaskType::Retest,
+                scheduled_for: evidence_date(2026, 9, 20),
+                sequence: 9,
+                attempt_no: 1,
+            })
+            .unwrap();
+        store.complete_task(other.id, "2026-09-19").unwrap();
+        let stale = store
+            .create_task(&store::NewTask {
+                book_id: 1,
+                chapter_id: chapter.id,
+                task_type: TaskType::Retest,
+                scheduled_for: evidence_date(2026, 9, 20),
+                sequence: 10,
+                attempt_no: 2,
+            })
+            .unwrap();
+        store.complete_task(stale.id, "2026-09-19").unwrap();
         let ev = chapter_evidence(&store, &chapter).unwrap();
         assert_eq!(ev.pages, 10);
         assert_eq!(ev.completed_on, Some(evidence_date(2026, 9, 21)));

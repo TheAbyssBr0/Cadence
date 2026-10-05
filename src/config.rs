@@ -122,17 +122,13 @@ impl Config {
     /// Filesystem path of the production SQLite database.
     #[must_use]
     pub fn db_path(&self) -> PathBuf {
-        let mut p = self.data_dir.clone();
-        p.push(DB_FILE_NAME);
-        p
+        self.data_dir.join(DB_FILE_NAME)
     }
 
     /// Filesystem path of the advisory lock file.
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
-        let mut p = self.data_dir.clone();
-        p.push(LOCK_FILE_NAME);
-        p
+        self.data_dir.join(LOCK_FILE_NAME)
     }
 }
 

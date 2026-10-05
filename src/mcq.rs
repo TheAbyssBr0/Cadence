@@ -1176,10 +1176,22 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_order_is_deterministic_per_seed() {
-        // Golden vectors: any PRNG-operator change alters these outputs.
-        assert_eq!(shuffle_order(7), [2, 1, 3, 0]);
-        assert_eq!(shuffle_order(1234), [3, 2, 1, 0]);
+    fn shuffle_order_golden_vectors() {
+        // Exact outputs: any PRNG-operator or loop-bound change alters these.
+        let expected: [[usize; 4]; 8] = [
+            [2, 3, 1, 0],
+            [2, 1, 0, 3],
+            [1, 3, 0, 2],
+            [2, 3, 0, 1],
+            [1, 2, 3, 0],
+            [3, 1, 2, 0],
+            [3, 2, 0, 1],
+            [2, 1, 3, 0],
+        ];
+        for (seed, want) in expected.iter().enumerate() {
+            let seed = u64::try_from(seed).unwrap();
+            assert_eq!(&shuffle_order(seed), want, "seed {seed}");
+        }
     }
 
     #[test]
