@@ -41,6 +41,8 @@ pub enum Commands {
     Notes(NotesArgs),
     /// Grading dispute workflow.
     Dispute(DisputeArgs),
+    /// Reset the library: delete all books, tasks, grades, notes, and history.
+    Reset(ResetArgs),
     /// System check: DB, nvim, PDF parser, LLM API, config, cache integrity.
     Doctor,
     /// Integration harness: isolated stage runs against fixture PDFs.
@@ -106,6 +108,14 @@ pub struct UnskipArgs {
 pub struct NotesArgs {
     /// Chapter id to print stored notes for (lists chapters when omitted).
     pub id: Option<i64>,
+}
+
+/// Args for `cadence reset`.
+#[derive(Debug, Args)]
+pub struct ResetArgs {
+    /// Skip the interactive confirmation prompt.
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
 }
 
 /// Args for `cadence dispute`.

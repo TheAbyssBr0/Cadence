@@ -2185,6 +2185,55 @@ fn format_book_progress(progress: &BookProgress) -> String {
     )
 }
 
+/// Wipe every library record plus the extracted unit-text cache
+/// (`<data_dir>/books/`). The schema `version` row and the content-addressed
+/// LLM cache survive (neither references a book); the config file and the
+/// original PDF are kept.
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from clearing and [`Error::Io`] from
+/// unit-cache removal.
+fn clear_library_data(store: &mut dyn Store, config: &Config) -> Result<()> {
+    store.clear_library()?;
+    let books_dir = config.data_dir.join("books");
+    if books_dir.exists() {
+        std::fs::remove_dir_all(&books_dir)?;
+    }
+    Ok(())
+}
+
+/// Render the tracked-library summary shared by the ingest guard and
+/// `reset`: one header plus per-book progress lines. Pure text (the
+/// `print_*` twin writes it).
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from progress reads.
+fn format_library_summary(store: &dyn Store, books: &[domain::Book]) -> Result<String> {
+    use std::fmt::Write as _;
+    // `write!` on a `String` never fails; results discarded throughout.
+    let mut out = String::new();
+    if books.len() == 1 {
+        let _ = writeln!(out, "Already tracking a book:");
+    } else {
+        let _ = writeln!(out, "Already tracking {} books:", books.len());
+    }
+    for book in books {
+        let _ = writeln!(
+            out,
+            "{}",
+            format_book_progress(&book_progress(store, book)?)
+        );
+    }
+    Ok(out)
+}
+
+fn print_library_summary(store: &dyn Store, books: &[domain::Book]) -> Result<()> {
+    print!("{}", format_library_summary(store, books)?);
+    Ok(())
+}
+
 /// Single-book guard (§3): `cadence` tracks one book at a time. When the
 /// store already holds books, show their progress and require an explicit
 /// `y` to wipe the library before ingesting `new_title`: every record goes
@@ -2201,14 +2250,7 @@ fn guard_single_book(store: &mut dyn Store, config: &Config, new_title: &str) ->
     if books.is_empty() {
         return Ok(true);
     }
-    if books.len() == 1 {
-        println!("Already tracking a book:");
-    } else {
-        println!("Already tracking {} books:", books.len());
-    }
-    for book in &books {
-        println!("{}", format_book_progress(&book_progress(store, book)?));
-    }
+    print_library_summary(store, &books)?;
     println!(
         "Starting a new book deletes ALL existing records (books, tasks, grades, notes, history). The PDF file itself is kept."
     );
@@ -2216,13 +2258,37 @@ fn guard_single_book(store: &mut dyn Store, config: &Config, new_title: &str) ->
         println!("Ingest aborted — existing library untouched.");
         return Ok(false);
     }
-    store.clear_library()?;
-    let books_dir = config.data_dir.join("books");
-    if books_dir.exists() {
-        std::fs::remove_dir_all(&books_dir)?;
-    }
+    clear_library_data(store, config)?;
     println!("Library cleared.");
     Ok(true)
+}
+
+/// `cadence reset`: wipe the library after an explicit `y` (or `--yes`).
+/// Same wipe scope as [`guard_single_book`]. An empty library is a no-op;
+/// anything but `y` aborts untouched. Piped stdin aborts unless `--yes` is
+/// given (see [`ask_destructive`]).
+///
+/// # Errors
+///
+/// Propagates [`Error::Store`] from listing/clearing and [`Error::Io`] from
+/// prompt reads and unit-cache removal.
+fn run_reset(store: &mut dyn Store, config: &Config, skip_confirm: bool) -> Result<()> {
+    let books = store.list_books()?;
+    if books.is_empty() {
+        println!("Library already empty — nothing to reset.");
+        return Ok(());
+    }
+    print_library_summary(store, &books)?;
+    println!(
+        "This deletes ALL existing records (books, tasks, grades, notes, history). The PDF file itself is kept."
+    );
+    if !skip_confirm && !ask_destructive("Reset the library? [y/N] > ")? {
+        println!("Reset aborted — existing library untouched.");
+        return Ok(());
+    }
+    clear_library_data(store, config)?;
+    println!("Library cleared.");
+    Ok(())
 }
 
 /// Real ingest: outline → split → extract → file store → book registration.
@@ -4379,6 +4445,10 @@ fn run() -> Result<()> {
                 resolve_dispute_target(&store, args.assignment_id, args.question)?;
             run_dispute(&mut store, chapter_id, question_no, args.text.as_deref())
         }
+        Commands::Reset(args) => {
+            let mut store = open_production_store(&config)?;
+            run_reset(&mut store, &config, args.yes)
+        }
         Commands::Doctor => {
             let mut problems: u32 = 0;
             match Config::load() {
@@ -5970,6 +6040,85 @@ mod tests {
     fn guard_single_book_passes_empty_library() {
         let mut store = MemoryStore::new();
         assert!(guard_single_book(&mut store, &Config::default(), "New").unwrap());
+    }
+
+    fn reset_test_config(name: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("cadence-reset-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Config {
+            data_dir: dir,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn reset_empty_library_is_noop() {
+        let mut store = MemoryStore::new();
+        let config = reset_test_config("empty");
+        run_reset(&mut store, &config, true).unwrap();
+        assert_eq!(store.list_books().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&config.data_dir);
+    }
+
+    #[test]
+    fn reset_with_yes_clears_library_and_books_dir() {
+        let mut store = MemoryStore::new();
+        let _chapter = mem_chapter(&mut store);
+        let config = reset_test_config("yes");
+        let books_dir = config.data_dir.join("books");
+        std::fs::create_dir_all(&books_dir).unwrap();
+        std::fs::write(books_dir.join("unit_1.json"), "{}").unwrap();
+        run_reset(&mut store, &config, true).unwrap();
+        assert_eq!(store.list_books().unwrap().len(), 0);
+        assert!(!books_dir.exists());
+        let _ = std::fs::remove_dir_all(&config.data_dir);
+    }
+
+    #[test]
+    fn reset_without_yes_aborts_on_piped_stdin() {
+        let mut store = MemoryStore::new();
+        let _chapter = mem_chapter(&mut store);
+        let config = reset_test_config("abort");
+        // Piped harness stdin: `ask_destructive` refuses (would block on a TTY).
+        run_reset(&mut store, &config, false).unwrap();
+        assert_eq!(store.list_books().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&config.data_dir);
+    }
+
+    #[test]
+    fn library_summary_names_each_tracked_book() {
+        let mut store = MemoryStore::new();
+        let _chapter = mem_chapter(&mut store);
+        let books = store.list_books().unwrap();
+        let single = format_library_summary(&store, &books).unwrap();
+        assert!(single.contains("Already tracking a book:"));
+        assert!(single.contains("Modern C"));
+        store
+            .create_book(
+                &store::NewBook {
+                    title: "Second".to_string(),
+                    filepath: "s.pdf".to_string(),
+                    file_hash: "h2".to_string(),
+                    start_page: 1,
+                },
+                "2026-01-02",
+            )
+            .unwrap();
+        let books = store.list_books().unwrap();
+        let plural = format_library_summary(&store, &books).unwrap();
+        assert!(plural.contains("Already tracking 2 books:"));
+        assert!(plural.contains("Second"));
+    }
+
+    #[test]
+    fn guard_single_book_aborts_on_piped_stdin() {
+        let mut store = MemoryStore::new();
+        let _chapter = mem_chapter(&mut store);
+        let config = reset_test_config("guard-abort");
+        // Piped harness stdin: `ask_destructive` refuses (would block on a TTY).
+        assert!(!guard_single_book(&mut store, &config, "New").unwrap());
+        assert_eq!(store.list_books().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&config.data_dir);
     }
 
     #[test]
